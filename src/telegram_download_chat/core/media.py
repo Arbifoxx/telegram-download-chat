@@ -425,39 +425,47 @@ class MediaMixin:
         dest_path: Path,
         num_workers: int,
     ) -> Optional[Path]:
-        """Download a file by splitting it across num_workers parallel chunk streams.
+        """Download a file using a work queue of fixed-size chunks.
 
-        Each worker i requests chunks at offsets i*CHUNK, i*CHUNK + stride,
-        i*CHUNK + 2*stride, … so together they cover every byte of the file
-        with no overlap. This mirrors how tdesktop downloads individual files
-        across multiple DC connections to saturate available bandwidth.
+        Workers independently pull chunk indices from a shared queue and write
+        directly to their position in a pre-allocated file. Because workers
+        never synchronize with each other, a momentary stall in one worker
+        does not idle the others, producing steady aggregate throughput instead
+        of the burst-then-pause pattern caused by stride-based approaches.
         """
-        stride = _CHUNK_SIZE * num_workers
+        num_chunks = (file_size + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for i in range(num_chunks):
+            queue.put_nowait(i)
 
         with open(dest_path, "wb") as f:
             f.seek(file_size - 1)
             f.write(b"\x00")
 
-        async def worker(start_offset: int) -> None:
-            current_offset = start_offset
-            with open(dest_path, "r+b") as f:
-                async for chunk in self.client.iter_download(
-                    message,
-                    offset=start_offset,
-                    stride=stride,
-                    request_size=_CHUNK_SIZE,
-                ):
-                    f.seek(current_offset)
-                    f.write(chunk)
-                    current_offset += stride
+        async def fetch_chunk(offset: int) -> bytes:
+            async for chunk in self.client.iter_download(
+                message,
+                offset=offset,
+                request_size=_CHUNK_SIZE,
+            ):
+                return chunk
+            return b""
 
-        active_workers = [
-            worker(i * _CHUNK_SIZE)
-            for i in range(num_workers)
-            if i * _CHUNK_SIZE < file_size
-        ]
+        async def worker() -> None:
+            while True:
+                try:
+                    idx = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                offset = idx * _CHUNK_SIZE
+                chunk = await fetch_chunk(offset)
+                with open(dest_path, "r+b") as f:
+                    f.seek(offset)
+                    f.write(chunk)
+
         try:
-            await asyncio.gather(*active_workers)
+            await asyncio.gather(*[worker() for _ in range(num_workers)])
         except Exception:
             dest_path.unlink(missing_ok=True)
             raise
