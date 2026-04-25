@@ -18,6 +18,17 @@ settings:
   request_delay: 0.1
   # Maximum number of retries for failed requests
   max_retries: 5
+
+  # Number of media files to download concurrently when using --media.
+  # Reduce to 1-2 if you hit Telegram rate limits during batch downloads.
+  # Telegram Premium users can typically sustain higher values.
+  download_concurrency: 5
+
+  # Number of parallel chunk workers per file for large downloads (>= 5 MB).
+  # Each worker opens a separate connection to the file's DC and downloads a
+  # different stripe of the file simultaneously, multiplying effective speed.
+  # 4 workers typically saturates a premium account's allowed bandwidth.
+  download_workers: 4
   
   # Log file path (empty for console only)
   log_file: ./data/telegram_downloader.log

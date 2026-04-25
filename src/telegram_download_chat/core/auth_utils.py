@@ -119,6 +119,9 @@ class TelegramAuth:
                 "system_version": "1.0.0",
                 "lang_code": "en",
                 "system_lang_code": "en",
+                "flood_sleep_threshold": 60,
+                "connection_retries": 5,
+                "retry_delay": 1,
             }
 
             proxy = self.parse_proxy_url(self.proxy_url)

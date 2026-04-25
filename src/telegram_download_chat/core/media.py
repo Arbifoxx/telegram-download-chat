@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Document,
     DocumentAttributeFilename,
@@ -37,6 +38,9 @@ _CAT_CONTACTS = "contacts"
 _CAT_LOCATIONS = "locations"
 _CAT_POLLS = "polls"
 _CAT_OTHER = "other"
+
+_PARALLEL_THRESHOLD = 5 * 1024 * 1024  # parallelize files >= 5 MB
+_CHUNK_SIZE = 512 * 1024               # 512 KB per request (Telegram's standard block)
 
 _ARCHIVE_MIMES = {
     "application/zip",
@@ -288,30 +292,73 @@ class MediaMixin:
 
         download_to.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            # Synthetic types: write directly without a network call
-            if self._serialize_synthetic_media(media, download_to):
-                return download_to
+        settings = getattr(self, "config", {}).get("settings", {})
+        max_retries = settings.get("max_retries", 5)
+        num_workers = settings.get("download_workers", 4)
 
-            # Binary types: pass full message so Telethon resolves WebPage internally
-            downloaded_path = await self.client.download_media(
-                message, file=download_to
-            )
-            if downloaded_path:
-                self.logger.debug(
-                    f"Downloaded media for message {message_id}: {downloaded_path}"
+        use_parallel = (
+            isinstance(media, MessageMediaDocument)
+            and isinstance(media.document, Document)
+            and media.document.size >= _PARALLEL_THRESHOLD
+        )
+
+        for attempt in range(max_retries + 1):
+            try:
+                if self._serialize_synthetic_media(media, download_to):
+                    return download_to
+
+                if use_parallel:
+                    result = await self._download_parallel(
+                        message,
+                        media.document.size,
+                        download_to,
+                        num_workers,
+                    )
+                else:
+                    result = await self.client.download_media(
+                        message, file=download_to
+                    )
+                    result = Path(result) if result else None
+
+                if result:
+                    self.logger.debug(
+                        f"Downloaded media for message {message_id}: {result}"
+                    )
+                    return result
+                else:
+                    self.logger.warning(
+                        f"Failed to download media for message {message_id}"
+                    )
+                    return None
+
+            except FloodWaitError as e:
+                wait = e.seconds + 1
+                self.logger.info(
+                    f"Flood-wait {wait}s for message {message_id} "
+                    f"(attempt {attempt + 1}/{max_retries + 1}), sleeping..."
                 )
-                return Path(downloaded_path)
-            else:
-                self.logger.warning(
-                    f"Failed to download media for message {message_id}"
-                )
-                return None
-        except Exception as e:
-            self.logger.warning(
-                f"Failed to download media for message {message_id}: {e}"
-            )
-            return None
+                await asyncio.sleep(wait)
+
+            except Exception as e:
+                if attempt < max_retries:
+                    backoff = 2 ** attempt
+                    self.logger.warning(
+                        f"Media download attempt {attempt + 1}/{max_retries + 1} "
+                        f"failed for message {message_id}: {e}. "
+                        f"Retrying in {backoff}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    self.logger.warning(
+                        f"Failed to download media for message {message_id} "
+                        f"after {max_retries + 1} attempts: {e}"
+                    )
+                    return None
+
+        self.logger.warning(
+            f"Gave up downloading media for message {message_id} after flood waits"
+        )
+        return None
 
     async def download_all_media(
         self,
@@ -323,7 +370,8 @@ class MediaMixin:
         Returns dict mapping str(message_id) -> relative path (from attachments_dir)
         for each successfully downloaded file.
         """
-        CONCURRENCY = 5
+        settings = getattr(self, "config", {}).get("settings", {})
+        CONCURRENCY = settings.get("download_concurrency", 5)
         semaphore = asyncio.Semaphore(CONCURRENCY)
         results: Dict[str, str] = {}
         total = len(messages)
@@ -369,6 +417,51 @@ class MediaMixin:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    async def _download_parallel(
+        self,
+        message: Any,
+        file_size: int,
+        dest_path: Path,
+        num_workers: int,
+    ) -> Optional[Path]:
+        """Download a file by splitting it across num_workers parallel chunk streams.
+
+        Each worker i requests chunks at offsets i*CHUNK, i*CHUNK + stride,
+        i*CHUNK + 2*stride, … so together they cover every byte of the file
+        with no overlap. This mirrors how tdesktop downloads individual files
+        across multiple DC connections to saturate available bandwidth.
+        """
+        stride = _CHUNK_SIZE * num_workers
+
+        with open(dest_path, "wb") as f:
+            f.seek(file_size - 1)
+            f.write(b"\x00")
+
+        async def worker(start_offset: int) -> None:
+            current_offset = start_offset
+            with open(dest_path, "r+b") as f:
+                async for chunk in self.client.iter_download(
+                    message,
+                    offset=start_offset,
+                    stride=stride,
+                    request_size=_CHUNK_SIZE,
+                ):
+                    f.seek(current_offset)
+                    f.write(chunk)
+                    current_offset += stride
+
+        active_workers = [
+            worker(i * _CHUNK_SIZE)
+            for i in range(num_workers)
+            if i * _CHUNK_SIZE < file_size
+        ]
+        try:
+            await asyncio.gather(*active_workers)
+        except Exception:
+            dest_path.unlink(missing_ok=True)
+            raise
+        return dest_path
 
     def _get_media_category(self, media: Any) -> str:
         """Return the category subdirectory name for a media object."""
