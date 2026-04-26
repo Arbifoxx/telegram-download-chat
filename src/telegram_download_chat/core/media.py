@@ -362,6 +362,7 @@ class MediaMixin:
                 else:
                     result = await self._download_small_media(
                         message,
+                        media,
                         file_size,
                         temp_path,
                         download_to,
@@ -427,6 +428,17 @@ class MediaMixin:
         """Return the on-disk temp file path used for atomic/resumable downloads."""
         return final_path.with_name(f"{final_path.name}.part")
 
+    def _get_direct_download_source(self, message: Any, media: Any) -> Any:
+        """Return the object Telethon should resolve into an input file location."""
+        if isinstance(media, MessageMediaWebPage):
+            webpage = media.webpage
+            if isinstance(webpage, WebPage):
+                if webpage.document and isinstance(webpage.document, Document):
+                    return webpage.document
+                if webpage.photo and isinstance(webpage.photo, Photo):
+                    return webpage.photo
+        return message
+
     def _emit_media_progress(
         self,
         filename: str,
@@ -488,31 +500,60 @@ class MediaMixin:
     async def _download_small_media(
         self,
         message: Any,
+        media: Any,
         file_size: int,
         temp_path: Path,
         final_path: Path,
         filename: str,
         resume_event: Optional[asyncio.Event] = None,
     ) -> Optional[Path]:
-        """Download a smaller binary media file atomically via Telethon."""
+        """Download a smaller binary media file atomically via direct requests."""
         temp_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path.unlink(missing_ok=True)
 
-        def progress_callback(done: int, total: int) -> None:
-            resolved_total = int(total or file_size or 0)
-            self._emit_media_progress(filename, int(done), resolved_total)
+        download_source = self._get_direct_download_source(message, media)
+        file_info = utils._get_file_info(download_source)
+        resolved_size = int(file_size or file_info.size or 0)
+        msg_data = None
+        if hasattr(message, "input_chat") and getattr(message, "input_chat", None):
+            msg_data = (message.input_chat, message.id)
 
-        result = await self.client.download_media(
-            message,
-            file=temp_path,
-            progress_callback=progress_callback,
+        bytes_done = 0
+        stream = _DirectDownloadIter(
+            self.client,
+            None,
+            file=file_info.location,
+            dc_id=file_info.dc_id,
+            offset=0,
+            stride=_CHUNK_SIZE,
+            chunk_size=_CHUNK_SIZE,
+            request_size=_CHUNK_SIZE,
+            file_size=resolved_size,
+            msg_data=msg_data,
         )
-        if not result:
+
+        try:
+            with open(temp_path, "wb") as fh:
+                async for chunk in stream:
+                    await self._wait_for_media_resume(resume_event)
+                    if self._stop_requested:
+                        fh.flush()
+                        return None
+
+                    fh.write(chunk)
+                    bytes_done += len(chunk)
+                    self._emit_media_progress(filename, bytes_done, resolved_size)
+        finally:
+            await stream.close()
+
+        if resolved_size > 0 and bytes_done < resolved_size:
             return None
 
-        if file_size > 0:
-            self._emit_media_progress(filename, file_size, file_size, force=True)
-        return self._finalize_media_download(temp_path, final_path, file_size)
+        if resolved_size > 0:
+            self._emit_media_progress(
+                filename, resolved_size, resolved_size, force=True
+            )
+        return self._finalize_media_download(temp_path, final_path, resolved_size)
 
     async def _wait_for_media_resume(
         self, resume_event: Optional[asyncio.Event] = None
@@ -692,7 +733,13 @@ class MediaMixin:
                 f.write(b"\x00")
 
         bytes_done = 0
-        file_info = utils._get_file_info(message)
+        download_source = self._get_direct_download_source(
+            message,
+            getattr(message, "media", None) or (
+                message.get("media") if isinstance(message, dict) else None
+            ),
+        )
+        file_info = utils._get_file_info(download_source)
         input_location = file_info.location
         dc_id = file_info.dc_id
         msg_data = None
