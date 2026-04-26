@@ -781,13 +781,12 @@ class MediaMixin:
                         offset = await claim_offset()
                         if offset is None:
                             break
-                        limit = min(part_size, file_size - offset)
                         task = asyncio.create_task(
                             self._request_file_part(
                                 session,
                                 file_state,
                                 offset,
-                                limit,
+                                part_size,
                                 msg_data,
                             )
                         )
@@ -812,13 +811,12 @@ class MediaMixin:
                                 dc_id,
                                 session_index=session_index,
                             )
-                            retry_limit = min(part_size, file_size - offset)
                             retry_task = asyncio.create_task(
                                 self._request_file_part(
                                     session,
                                     file_state,
                                     offset,
-                                    retry_limit,
+                                    part_size,
                                     msg_data,
                                 )
                             )
