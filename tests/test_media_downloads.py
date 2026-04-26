@@ -15,6 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover - local fallback for ad-hoc exec
     pytest = _PytestFallback()
 
 from telegram_download_chat.core.media import MediaMixin, _CHUNK_SIZE
+from telegram_download_chat.core.render import _attachment_meta_from_message
 
 
 class DummyDownloader(MediaMixin):
@@ -201,3 +202,25 @@ async def test_existing_wrong_size_file_is_re_downloaded(tmp_path):
 
     assert result == final_path
     downloader._download_small_media.assert_awaited_once()
+
+
+def test_attachment_meta_is_inferred_without_downloaded_file():
+    msg = {
+        "media": {
+            "_": "MessageMediaDocument",
+            "document": {
+                "size": 110100480,
+                "attributes": [
+                    {"_": "DocumentAttributeFilename", "file_name": "1A420.tar.bz2"}
+                ],
+            },
+        },
+        "attachment_path": None,
+    }
+
+    meta = _attachment_meta_from_message(msg)
+
+    assert meta["attachment_downloaded"] is False
+    assert meta["media_category"] == "archives"
+    assert meta["attachment_filename"] == "1A420.tar.bz2"
+    assert meta["attachment_size_label"] == "105.0 MB"

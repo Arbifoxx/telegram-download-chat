@@ -311,7 +311,7 @@ class MainWindow(QMainWindow):
             scan_dir = Path(output_dir) if output_dir else get_downloads_dir()
             self._files_before_download = set()
             if scan_dir.exists():
-                for ext in ("*.json", "*.txt"):
+                for ext in ("*.json", "*.txt", "*.html", "*.pdf"):
                     self._files_before_download.update(
                         str(f.absolute()) for f in scan_dir.rglob(ext) if f.is_file()
                     )

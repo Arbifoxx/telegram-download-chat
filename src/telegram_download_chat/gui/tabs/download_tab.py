@@ -1,5 +1,7 @@
 """Download tab for the Telegram Download Chat GUI."""
 
+import importlib.util
+from pathlib import Path
 from typing import Any, Dict
 
 from PySide6.QtCore import QDate, QModelIndex, QPropertyAnimation, Qt, QTimer, Signal
@@ -775,8 +777,8 @@ class DownloadTab(QWidget):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Output As",
-            str(default_dir / "output.txt"),
-            "Text Files (*.txt);;All Files (*)",
+            str(default_dir / "messages.json"),
+            "JSON Files (*.json);;All Files (*)",
         )
 
         if file_path:
@@ -801,6 +803,11 @@ class DownloadTab(QWidget):
         # Get or generate output path
         output_path = self.output_edit.text().strip()
         if output_path:
+            output_path_obj = Path(output_path)
+            if output_path_obj.suffix.lower() in {".txt", ".html", ".pdf"}:
+                output_path_obj = output_path_obj.with_suffix(".json")
+                self.output_edit.setText(str(output_path_obj))
+            output_path = str(output_path_obj)
             cmd_args.extend(["--output", output_path])
 
         # Add optional arguments
@@ -848,9 +855,23 @@ class DownloadTab(QWidget):
         cmd_args.extend(["--download-concurrency", str(self.concurrency_spin.value())])
 
         if self.html_chk.isChecked():
+            if importlib.util.find_spec("jinja2") is None:
+                QMessageBox.warning(
+                    self,
+                    "Missing Dependency",
+                    "HTML export requires the 'jinja2' package in the current Python environment.",
+                )
+                return
             cmd_args.append("--html")
 
         if self.pdf_chk.isChecked():
+            if importlib.util.find_spec("reportlab") is None:
+                QMessageBox.warning(
+                    self,
+                    "Missing Dependency",
+                    "PDF export requires the 'reportlab' package in the current Python environment.",
+                )
+                return
             cmd_args.append("--pdf")
 
         # Update UI for download start

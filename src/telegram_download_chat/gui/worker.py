@@ -326,7 +326,7 @@ class WorkerThread(QThread):
             if p.exists():
                 # Get list of files with full paths and sort by modification time, newest first
                 all_files = []
-                for ext in ("*.json", "*.txt"):
+                for ext in ("*.json", "*.txt", "*.html", "*.pdf"):
                     all_files.extend(f for f in p.rglob(ext) if f.is_file())
                 files.extend(
                     str(f.absolute())

@@ -120,8 +120,11 @@ a:hover{text-decoration:underline}
 .media-aud{width:260px;max-width:100%;margin-bottom:4px;display:block}
 .media-file{display:flex;align-items:center;gap:10px;background:rgba(0,0,0,0.04);text-decoration:none;color:inherit;
   border-radius:10px;padding:8px 10px;margin-bottom:4px}
+.media-file.missing{opacity:.9}
 .media-file .ico{font-size:26px;line-height:1;flex-shrink:0}
+.media-file .meta{display:flex;flex-direction:column;align-items:flex-start;gap:1px;flex:1;min-width:0;margin-top:0}
 .media-file .fname{font-size:13px;font-weight:500;color:#333;word-break:break-all}
+.media-file .sub{font-size:12px;color:#6d7b88}
 .media-loc{margin-bottom:4px;font-size:13px}
 .poll-wrap{margin-bottom:4px}
 .poll-q{font-weight:600;margin-bottom:5px;font-size:13.5px}
@@ -177,23 +180,42 @@ a:hover{text-decoration:underline}
       {%- if msg.reply_text %}
       <div class="rq">{{ msg.reply_text | e }}</div>
       {%- endif %}
-      {%- if msg.attachment_path %}
+      {%- if msg.media_category %}
+        {%- set downloaded = msg.attachment_downloaded %}
+        {%- if downloaded %}
         {%- set src = (media_prefix + msg.attachment_path) | urlencode_path %}
+        {%- endif %}
         {%- if msg.media_category == "stickers" %}
-        <img class="media-stk" src="{{ src }}" alt="sticker" loading="lazy">
+        {%- if downloaded %}<img class="media-stk" src="{{ src }}" alt="sticker" loading="lazy">{% else %}
+        <div class="media-file missing"><div class="ico">&#128444;</div><div class="meta"><div class="fname">{{ msg.attachment_filename | default("Sticker", true) | e }}</div><div class="sub">Sticker not downloaded</div></div></div>
+        {%- endif %}
         {%- elif msg.media_category == "images" %}
-        <img class="media-img" src="{{ src }}" alt="" loading="lazy">
+        {%- if downloaded %}<img class="media-img" src="{{ src }}" alt="" loading="lazy">{% else %}
+        <div class="media-file missing"><div class="ico">&#128444;</div><div class="meta"><div class="fname">{{ msg.attachment_filename | default("Image", true) | e }}</div><div class="sub">{% if msg.attachment_size_label %}{{ msg.attachment_size_label | e }} · {% endif %}Image not downloaded</div></div></div>
+        {%- endif %}
         {%- elif msg.media_category == "videos" %}
-        <video class="media-vid" controls preload="none" src="{{ src }}"></video>
+        {%- if downloaded %}<video class="media-vid" controls preload="none" src="{{ src }}"></video>{% else %}
+        <div class="media-file missing"><div class="ico">&#127909;</div><div class="meta"><div class="fname">{{ msg.attachment_filename | e }}</div><div class="sub">{% if msg.attachment_size_label %}{{ msg.attachment_size_label | e }} · {% endif %}Video not downloaded</div></div></div>
+        {%- endif %}
         {%- elif msg.media_category == "audio" %}
-        <audio class="media-aud" controls preload="none" src="{{ src }}"></audio>
+        {%- if downloaded %}<audio class="media-aud" controls preload="none" src="{{ src }}"></audio>{% else %}
+        <div class="media-file missing"><div class="ico">&#127911;</div><div class="meta"><div class="fname">{{ msg.attachment_filename | e }}</div><div class="sub">{% if msg.attachment_size_label %}{{ msg.attachment_size_label | e }} · {% endif %}Audio not downloaded</div></div></div>
+        {%- endif %}
         {%- elif msg.media_category in ("documents", "archives") %}
+        {%- if downloaded %}
         <a class="media-file" href="{{ src }}" target="_blank" rel="noopener">
           <div class="ico">{% if msg.media_category == "archives" %}&#128736;{% else %}&#128196;{% endif %}</div>
-          <div class="fname">{{ msg.attachment_filename | e }}</div>
+          <div class="meta"><div class="fname">{{ msg.attachment_filename | e }}</div><div class="sub">{% if msg.attachment_size_label %}{{ msg.attachment_size_label | e }} · {% endif %}Download</div></div>
         </a>
+        {%- else %}
+        <div class="media-file missing">
+          <div class="ico">{% if msg.media_category == "archives" %}&#128736;{% else %}&#128196;{% endif %}</div>
+          <div class="meta"><div class="fname">{{ msg.attachment_filename | e }}</div><div class="sub">{% if msg.attachment_size_label %}{{ msg.attachment_size_label | e }} · {% endif %}Attachment not downloaded</div></div>
+        </div>
+        {%- endif %}
         {%- elif msg.media_category == "contacts" %}
-        <a class="media-file" href="{{ src }}" target="_blank" rel="noopener"><div class="ico">&#128100;</div><div class="fname">{{ msg.attachment_filename | e }}</div></a>
+        {%- if downloaded %}<a class="media-file" href="{{ src }}" target="_blank" rel="noopener"><div class="ico">&#128100;</div><div class="meta"><div class="fname">{{ msg.attachment_filename | e }}</div><div class="sub">Contact</div></div></a>{% else %}
+        <div class="media-file missing"><div class="ico">&#128100;</div><div class="meta"><div class="fname">{{ msg.attachment_filename | e }}</div><div class="sub">Contact not downloaded</div></div></div>{% endif %}
         {%- elif msg.media_category == "locations" %}
         <div class="media-loc">&#128205; <a href="https://maps.google.com/?q={{ msg.location_lat }},{{ msg.location_lng }}" target="_blank" rel="noopener">View on map</a></div>
         {%- elif msg.media_category == "polls" and msg.poll_data %}
@@ -207,10 +229,12 @@ a:hover{text-decoration:underline}
           {%- endif %}
         </div>
         {%- else %}
-        <a class="media-file" href="{{ src }}" target="_blank" rel="noopener">
+        {%- if downloaded %}<a class="media-file" href="{{ src }}" target="_blank" rel="noopener">
           <div class="ico">&#128206;</div>
-          <div class="fname">{{ msg.attachment_filename | e }}</div>
-        </a>
+          <div class="meta"><div class="fname">{{ msg.attachment_filename | e }}</div><div class="sub">{% if msg.attachment_size_label %}{{ msg.attachment_size_label | e }} · {% endif %}Download</div></div>
+        </a>{% else %}
+        <div class="media-file missing"><div class="ico">&#128206;</div><div class="meta"><div class="fname">{{ msg.attachment_filename | e }}</div><div class="sub">{% if msg.attachment_size_label %}{{ msg.attachment_size_label | e }} · {% endif %}Attachment not downloaded</div></div></div>
+        {%- endif %}
         {%- endif %}
       {%- endif %}
       {%- if msg.text %}
@@ -383,37 +407,27 @@ class RenderMixin:
                 }
 
             # ── Per-message render data ──────────────────────────────
-            att_path = msg.get("attachment_path")
-            att_cat: Optional[str] = None
-            att_filename: Optional[str] = None
+            att_meta = _attachment_meta_from_message(msg)
+            att_path = att_meta["attachment_path"]
+            att_cat: Optional[str] = att_meta["media_category"]
+            att_filename: Optional[str] = att_meta["attachment_filename"]
             poll_data: Optional[Dict[str, Any]] = None
             loc_lat: float = 0.0
             loc_lng: float = 0.0
 
             if att_path:
-                # Normalize Windows backslashes to forward slashes
-                att_path = att_path.replace("\\", "/")
-                # Reject paths with traversal segments unconditionally
                 if (
                     ".." in Path(att_path).parts
                     or Path(att_path).is_absolute()
                     or ":" in att_path
                 ):
                     att_path = None
-                # Also validate resolved path stays within attachments directory
                 elif attachments_dir:
                     resolved = (attachments_dir / att_path).resolve()
                     try:
                         resolved.relative_to(attachments_dir.resolve())
                     except ValueError:
                         att_path = None
-                if att_path:
-                    parts_split = att_path.split("/")
-                    att_cat = parts_split[0] if parts_split else None
-                    att_filename = Path(att_path).name
-                else:
-                    att_cat = None
-                    att_filename = None
 
             if att_path and att_cat:
                 if att_cat == "polls" and attachments_dir:
@@ -460,6 +474,8 @@ class RenderMixin:
                     "attachment_path": att_path,
                     "attachment_filename": att_filename,
                     "media_category": att_cat,
+                    "attachment_downloaded": att_meta["attachment_downloaded"] and bool(att_path),
+                    "attachment_size_label": att_meta["attachment_size_label"],
                     "poll_data": poll_data,
                     "location_lat": loc_lat,
                     "location_lng": loc_lng,
@@ -538,6 +554,88 @@ def _service_text(action: Dict[str, Any], msg: Dict[str, Any]) -> Optional[str]:
         if new_title:
             label = f"changed the group name to \u201c{new_title}\u201d"
     return f"{sender} {label}"
+
+
+def _format_size(num_bytes: Optional[int]) -> Optional[str]:
+    if not num_bytes or num_bytes <= 0:
+        return None
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return None
+
+
+def _attachment_meta_from_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Infer attachment display metadata even when files were not downloaded."""
+    media = msg.get("media")
+    attachment_path = msg.get("attachment_path")
+    filename = None
+    category = None
+    size = None
+
+    if attachment_path:
+        normalized = str(attachment_path).replace("\\", "/")
+        parts = normalized.split("/")
+        category = parts[0] if parts else None
+        filename = Path(normalized).name
+
+    if isinstance(media, dict):
+        media_type = media.get("_")
+        if media_type == "MessageMediaPhoto":
+            category = category or "images"
+            filename = filename or "Photo"
+        elif media_type == "MessageMediaDocument":
+            doc = media.get("document")
+            if isinstance(doc, dict):
+                size = doc.get("size") if isinstance(doc.get("size"), int) else size
+                attrs = doc.get("attributes", [])
+                has_sticker = False
+                has_audio = False
+                has_video = False
+                for attr in attrs if isinstance(attrs, list) else []:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_type = attr.get("_")
+                    if attr_type == "DocumentAttributeFilename" and not filename:
+                        filename = attr.get("file_name")
+                    elif attr_type == "DocumentAttributeSticker":
+                        has_sticker = True
+                    elif attr_type == "DocumentAttributeAudio":
+                        has_audio = True
+                    elif attr_type == "DocumentAttributeVideo":
+                        has_video = True
+                if has_sticker:
+                    category = category or "stickers"
+                elif has_audio:
+                    category = category or "audio"
+                elif has_video:
+                    category = category or "videos"
+                else:
+                    ext = Path(filename or "").suffix.lower()
+                    if ext in {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".ipsw"}:
+                        category = category or "archives"
+                    else:
+                        category = category or "documents"
+        elif media_type == "MessageMediaContact":
+            category = category or "contacts"
+            filename = filename or "Contact"
+        elif media_type in ("MessageMediaGeo", "MessageMediaGeoLive", "MessageMediaVenue"):
+            category = category or "locations"
+            filename = filename or "Location"
+        elif media_type == "MessageMediaPoll":
+            category = category or "polls"
+            filename = filename or "Poll"
+
+    return {
+        "attachment_path": attachment_path.replace("\\", "/") if isinstance(attachment_path, str) else None,
+        "attachment_filename": filename,
+        "media_category": category,
+        "attachment_downloaded": bool(attachment_path),
+        "attachment_size": size,
+        "attachment_size_label": _format_size(size),
+    }
 
 
 def _xml_escape(text: str) -> str:
@@ -697,6 +795,22 @@ def _register_unicode_fonts() -> Dict[str, str]:
 
 
 def _render_pdf_reportlab(
+    mixin: Any,
+    messages: List[Dict[str, Any]],
+    output_file: Path,
+    attachments_dir: Optional[Path],
+    chat_title: str,
+) -> None:
+    try:
+        _build_rich_pdf_reportlab(mixin, messages, output_file, attachments_dir, chat_title)
+    except Exception as exc:
+        _log(mixin).warning(
+            "Rich PDF export failed, falling back to simplified layout: %s", exc
+        )
+        _build_simple_pdf_reportlab(mixin, messages, output_file, attachments_dir, chat_title)
+
+
+def _build_rich_pdf_reportlab(
     mixin: Any,
     messages: List[Dict[str, Any]],
     output_file: Path,
@@ -998,5 +1112,90 @@ def _render_pdf_reportlab(
                 tbl.setStyle(ts)
                 story.append(tbl)
                 story.append(Spacer(1, 1.5 * mm))
+
+    doc.build(story)
+
+
+def _build_simple_pdf_reportlab(
+    mixin: Any,
+    messages: List[Dict[str, Any]],
+    output_file: Path,
+    attachments_dir: Optional[Path],
+    chat_title: str,
+) -> None:
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+    fonts = _register_unicode_fonts()
+    FONT = fonts["regular"]
+    FONT_BOLD = fonts["bold"]
+    FONT_OBLIQUE = fonts["oblique"]
+
+    def style(**kw) -> ParagraphStyle:
+        base = dict(fontSize=10, fontName=FONT, leading=13)
+        base.update(kw)
+        return ParagraphStyle("_fallback", **base)
+
+    s_title = style(fontSize=16, fontName=FONT_BOLD, spaceAfter=4)
+    s_datesep = style(fontSize=9, alignment=TA_CENTER, textColor=colors.grey, spaceBefore=6, spaceAfter=3)
+    s_sender = style(fontSize=10, fontName=FONT_BOLD, textColor=colors.darkblue, spaceAfter=2)
+    s_body = style(fontSize=10, spaceAfter=2)
+    s_meta = style(fontSize=8, fontName=FONT_OBLIQUE, textColor=colors.grey, spaceAfter=5)
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    doc = SimpleDocTemplate(
+        str(output_file),
+        pagesize=A4,
+        leftMargin=10 * mm,
+        rightMargin=10 * mm,
+        topMargin=10 * mm,
+        bottomMargin=10 * mm,
+    )
+
+    items = mixin._preprocess_messages(messages, attachments_dir)
+    story = [Paragraph(_xml_escape(chat_title), s_title)]
+
+    for item in items:
+        if item["type"] == "date_sep":
+            story.append(Paragraph(_xml_escape(item["label"]), s_datesep))
+            continue
+        if item["type"] == "service":
+            story.append(Paragraph(_xml_escape(item["text"]), s_meta))
+            continue
+
+        for msg_data in item["messages"]:
+            story.append(
+                Paragraph(
+                    _xml_escape(item["sender_name"]) + (" (outgoing)" if item["is_outgoing"] else ""),
+                    s_sender,
+                )
+            )
+            if msg_data.get("fwd_from_name"):
+                story.append(Paragraph(f"Forwarded from {_xml_escape(msg_data['fwd_from_name'])}", s_meta))
+            if msg_data.get("reply_text"):
+                story.append(Paragraph(f"Reply: {_xml_escape(str(msg_data['reply_text']))}", s_meta))
+
+            if msg_data.get("media_category"):
+                label = msg_data.get("attachment_filename") or msg_data.get("media_category") or "Attachment"
+                suffix = []
+                if msg_data.get("attachment_size_label"):
+                    suffix.append(msg_data["attachment_size_label"])
+                suffix.append("downloaded" if msg_data.get("attachment_downloaded") else "not downloaded")
+                story.append(
+                    Paragraph(
+                        f"Attachment: {_xml_escape(label)} ({_xml_escape(' · '.join(suffix))})",
+                        s_body,
+                    )
+                )
+
+            text = msg_data.get("text") or ""
+            if text:
+                story.append(Paragraph(_xml_escape(text).replace("\n", "<br/>"), s_body))
+            story.append(Paragraph(_xml_escape(msg_data.get("time", "")), s_meta))
+            story.append(Spacer(1, 2 * mm))
 
     doc.build(story)
