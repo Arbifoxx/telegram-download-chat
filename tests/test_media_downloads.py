@@ -32,61 +32,14 @@ class DummyDownloader(MediaMixin):
         self._stop_file = None
         self._pause_file = None
         self._manual_pause_logged = False
+        self._media_progress_state = {}
 
 
 @pytest.mark.asyncio
-async def test_large_media_download_uses_parallel_direct_stripes(tmp_path):
+async def test_part_scheduler_downloads_all_parts_across_sessions(tmp_path):
     downloader = DummyDownloader()
-    payload = bytes(range(256)) * ((_CHUNK_SIZE * 4) // 256)
-    downloader.client = object()
-    downloader.config["settings"]["large_file_workers"] = 2
-
-    calls = []
-
-    class FakeDirectDownloadIter:
-        def __init__(
-            self,
-            client,
-            limit,
-            *,
-            file,
-            dc_id,
-            offset,
-            stride,
-            chunk_size,
-            request_size,
-            file_size,
-            msg_data,
-        ):
-            calls.append(
-                {
-                    "offset": offset,
-                    "stride": stride,
-                    "limit": limit,
-                    "chunk_size": chunk_size,
-                    "request_size": request_size,
-                    "file_size": file_size,
-                }
-            )
-            self.offset = offset
-            self.stride = stride
-            self.limit = limit
-            self.chunk_size = chunk_size
-            self.payload = payload
-
-        def __aiter__(self):
-            async def iterator():
-                pos = self.offset
-                emitted = 0
-                while pos < len(self.payload) and emitted < self.limit:
-                    yield self.payload[pos : pos + self.chunk_size]
-                    pos += self.stride
-                    emitted += 1
-
-            return iterator()
-
-        async def close(self):
-            return None
+    payload = bytes(range(256)) * ((_CHUNK_SIZE * 6) // 256)
+    downloader.client = type("Client", (), {"session": type("S", (), {"dc_id": 4})()})()
 
     class FakeFileInfo:
         def __init__(self, size):
@@ -94,10 +47,26 @@ async def test_large_media_download_uses_parallel_direct_stripes(tmp_path):
             self.dc_id = 4
             self.size = size
 
-    original_direct_iter = media_module._DirectDownloadIter
     original_get_file_info = media_module.utils._get_file_info
-    media_module._DirectDownloadIter = FakeDirectDownloadIter
     media_module.utils._get_file_info = lambda _: FakeFileInfo(len(payload))
+    created_sessions = []
+    seen_offsets = []
+
+    async def fake_create_download_session(dc_id, *, session_index):
+        created_sessions.append(session_index)
+        return {"index": session_index, "dc_id": dc_id, "kind": "fake"}
+
+    async def fake_close_download_session(session):
+        return None
+
+    async def fake_request_file_part(session, file_state, offset, limit, msg_data):
+        seen_offsets.append((session["index"], offset, limit))
+        await asyncio.sleep(0)
+        return payload[offset : offset + limit]
+
+    downloader._create_download_session = fake_create_download_session
+    downloader._close_download_session = fake_close_download_session
+    downloader._request_file_part = fake_request_file_part
 
     try:
         dest = tmp_path / "file.bin"
@@ -105,111 +74,56 @@ async def test_large_media_download_uses_parallel_direct_stripes(tmp_path):
         resume_event = asyncio.Event()
         resume_event.set()
 
-        result = await downloader._download_large_media(
+        result = await downloader._download_via_part_scheduler(
             message=object(),
+            media=object(),
             file_size=len(payload),
             temp_path=temp,
-            dest_path=dest,
+            final_path=dest,
             filename="file.bin",
+            session_count=2,
+            pipeline_depth=2,
             resume_event=resume_event,
         )
     finally:
-        media_module._DirectDownloadIter = original_direct_iter
         media_module.utils._get_file_info = original_get_file_info
 
     assert result == dest
     assert dest.read_bytes() == payload
     assert not temp.exists()
-    assert len(calls) == 2
-    assert {call["offset"] for call in calls} == {0, _CHUNK_SIZE}
-    assert all(call["stride"] == _CHUNK_SIZE * 2 for call in calls)
+    assert created_sessions == [0, 1]
+    assert {offset for _, offset, _ in seen_offsets} == set(
+        range(0, len(payload), _CHUNK_SIZE)
+    )
+    assert {session_index for session_index, _, _ in seen_offsets} == {0, 1}
 
 
 @pytest.mark.asyncio
-async def test_small_media_download_uses_direct_512kb_chunks(tmp_path):
+async def test_small_media_download_uses_scheduler_for_known_sizes(tmp_path):
     downloader = DummyDownloader()
-    payload = bytes(range(256)) * ((_CHUNK_SIZE * 2) // 256)
     downloader.client = object()
-
-    calls = []
-
-    class FakeDirectDownloadIter:
-        def __init__(
-            self,
-            client,
-            limit,
-            *,
-            file,
-            dc_id,
-            offset,
-            stride,
-            chunk_size,
-            request_size,
-            file_size,
-            msg_data,
-        ):
-            calls.append(
-                {
-                    "limit": limit,
-                    "offset": offset,
-                    "stride": stride,
-                    "chunk_size": chunk_size,
-                    "request_size": request_size,
-                    "file_size": file_size,
-                }
-            )
-            self.payload = payload
-            self.chunk_size = chunk_size
-
-        def __aiter__(self):
-            async def iterator():
-                pos = 0
-                while pos < len(self.payload):
-                    yield self.payload[pos : pos + self.chunk_size]
-                    pos += self.chunk_size
-
-            return iterator()
-
-        async def close(self):
-            return None
-
-    class FakeFileInfo:
-        def __init__(self, size):
-            self.location = object()
-            self.dc_id = 4
-            self.size = size
-
-    original_direct_iter = media_module._DirectDownloadIter
-    original_get_file_info = media_module.utils._get_file_info
-    media_module._DirectDownloadIter = FakeDirectDownloadIter
-    media_module.utils._get_file_info = lambda _: FakeFileInfo(len(payload))
+    expected_path = tmp_path / "small.bin"
+    downloader._download_via_part_scheduler = AsyncMock(return_value=expected_path)
 
     try:
-        dest = tmp_path / "small.bin"
-        temp = downloader._get_partial_media_path(dest)
+        temp = downloader._get_partial_media_path(expected_path)
         resume_event = asyncio.Event()
         resume_event.set()
 
         result = await downloader._download_small_media(
             message=object(),
             media=object(),
-            file_size=len(payload),
+            file_size=_CHUNK_SIZE * 3,
             temp_path=temp,
-            final_path=dest,
+            final_path=expected_path,
             filename="small.bin",
             resume_event=resume_event,
         )
     finally:
-        media_module._DirectDownloadIter = original_direct_iter
-        media_module.utils._get_file_info = original_get_file_info
+        pass
 
-    assert result == dest
-    assert dest.read_bytes() == payload
-    assert len(calls) == 1
-    assert calls[0]["offset"] == 0
-    assert calls[0]["stride"] == _CHUNK_SIZE
-    assert calls[0]["chunk_size"] == _CHUNK_SIZE
-    assert calls[0]["request_size"] == _CHUNK_SIZE
+    assert result == expected_path
+    downloader._download_via_part_scheduler.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -225,7 +139,12 @@ async def test_manual_pause_blocks_queued_media_downloads(tmp_path):
     first_release = asyncio.Event()
     second_started = asyncio.Event()
 
-    async def fake_download_message_media(msg, attachments_dir, resume_event=None):
+    async def fake_download_message_media(
+        msg,
+        attachments_dir,
+        resume_event=None,
+        overwrite_existing_files=False,
+    ):
         if msg["id"] == 1:
             first_started.set()
             await first_release.wait()
@@ -274,7 +193,12 @@ async def test_large_file_concurrency_is_capped(tmp_path):
     max_active_large = 0
     release = asyncio.Event()
 
-    async def fake_download_message_media(msg, attachments_dir, resume_event=None):
+    async def fake_download_message_media(
+        msg,
+        attachments_dir,
+        resume_event=None,
+        overwrite_existing_files=False,
+    ):
         nonlocal active_large, max_active_large
         active_large += 1
         max_active_large = max(max_active_large, active_large)
@@ -283,7 +207,7 @@ async def test_large_file_concurrency_is_capped(tmp_path):
         return attachments_dir / "documents" / f"{msg['id']}.bin"
 
     downloader.download_message_media = AsyncMock(side_effect=fake_download_message_media)
-    downloader._get_media_file_size = lambda media: _CHUNK_SIZE * 400
+    downloader._get_media_file_size = lambda media: _LARGE_FILE_THRESHOLD
 
     task = asyncio.create_task(
         downloader.download_all_media(

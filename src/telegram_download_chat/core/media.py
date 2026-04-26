@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from telethon import utils
-from telethon.client.downloads import _DirectDownloadIter
+from telethon import errors, functions, types, utils
+from telethon.crypto import AES
 from telethon.errors import FileReferenceExpiredError, FloodWaitError
 from telethon.tl.types import (
     Document,
@@ -45,8 +45,10 @@ _CAT_POLLS = "polls"
 _CAT_OTHER = "other"
 
 _LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # use striped downloads for files >= 100 MB
-_CHUNK_SIZE = 512 * 1024               # 512 KB per request (Telegram's standard block)
+_CHUNK_SIZE = 128 * 1024               # Telegram Desktop uses 128 KB file parts
 _LARGE_FILE_WORKERS = 8
+_DEFAULT_FILE_SESSIONS = 4
+_DEFAULT_PIPELINE_DEPTH = 4
 
 _ARCHIVE_MIMES = {
     "application/zip",
@@ -163,6 +165,10 @@ _MIME_TO_EXT = {
     # Database
     "application/x-sqlite3": ".db",
 }
+
+
+class _SessionResetRequired(Exception):
+    """Raised when the active sender needs to be recreated for the file DC."""
 
 
 class MediaMixin:
@@ -439,6 +445,34 @@ class MediaMixin:
                     return webpage.photo
         return message
 
+    def _get_file_session_count(self, file_size: int, *, large: bool) -> int:
+        """Choose how many concurrent MTProto sessions to use for one file."""
+        settings = getattr(self, "config", {}).get("settings", {})
+        configured = int(
+            settings.get(
+                "file_download_sessions",
+                settings.get(
+                    "large_file_workers",
+                    _LARGE_FILE_WORKERS if large else _DEFAULT_FILE_SESSIONS,
+                ),
+            )
+            or (_LARGE_FILE_WORKERS if large else _DEFAULT_FILE_SESSIONS)
+        )
+        part_count = max(1, (max(0, file_size) + _CHUNK_SIZE - 1) // _CHUNK_SIZE)
+        return max(1, min(configured, _LARGE_FILE_WORKERS, part_count))
+
+    def _get_pipeline_depth(self, file_size: int, *, large: bool) -> int:
+        """Return how many requests to keep in-flight per session."""
+        settings = getattr(self, "config", {}).get("settings", {})
+        configured = int(
+            settings.get(
+                "file_download_pipeline",
+                _DEFAULT_PIPELINE_DEPTH * (2 if large else 1),
+            )
+            or (_DEFAULT_PIPELINE_DEPTH * (2 if large else 1))
+        )
+        return max(1, configured)
+
     def _emit_media_progress(
         self,
         filename: str,
@@ -497,6 +531,369 @@ class MediaMixin:
             self._media_progress_state.pop(final_path.name, None)
         return final_path
 
+    async def _create_download_session(
+        self,
+        dc_id: int,
+        *,
+        session_index: int,
+    ) -> Dict[str, Any]:
+        """Create one transport session for pipelined file part downloads."""
+        current_dc = int(getattr(self.client.session, "dc_id", 0) or 0)
+        if session_index == 0 and dc_id == current_dc:
+            return {
+                "client": self.client,
+                "sender": self.client._sender,
+                "kind": "primary",
+                "dc_id": dc_id,
+                "cdn_client": None,
+                "cdn_dc_id": None,
+            }
+
+        if dc_id == current_dc:
+            session = await utils.maybe_async(self.client.session.clone())
+            temp_client = self.client.__class__(
+                session,
+                self.client.api_id,
+                self.client.api_hash,
+                connection=self.client._connection,
+                use_ipv6=getattr(self.client, "_use_ipv6", False),
+                proxy=self.client._proxy,
+                local_addr=self.client._local_addr,
+                timeout=self.client._timeout,
+                request_retries=self.client._request_retries,
+                connection_retries=self.client._connection_retries,
+                retry_delay=self.client._retry_delay,
+                auto_reconnect=self.client._auto_reconnect,
+                sequential_updates=self.client._sequential_updates,
+                flood_sleep_threshold=self.client.flood_sleep_threshold,
+                raise_last_call_error=self.client._raise_last_call_error,
+                loop=self.client.loop,
+                receive_updates=False,
+            )
+            temp_client.session.auth_key = self.client._sender.auth_key
+            dc = await self.client._get_dc(dc_id)
+            await temp_client._sender.connect(
+                self.client._connection(
+                    dc.ip_address,
+                    dc.port,
+                    dc.id,
+                    loggers=self.client._log,
+                    proxy=self.client._proxy,
+                    local_addr=self.client._local_addr,
+                )
+            )
+            return {
+                "client": temp_client,
+                "sender": temp_client._sender,
+                "kind": "client",
+                "dc_id": dc_id,
+                "cdn_client": None,
+                "cdn_dc_id": None,
+            }
+
+        sender = await self.client._create_exported_sender(dc_id)
+        return {
+            "client": self.client,
+            "sender": sender,
+            "kind": "sender",
+            "dc_id": dc_id,
+            "cdn_client": None,
+            "cdn_dc_id": None,
+        }
+
+    async def _close_download_session(self, session: Optional[Dict[str, Any]]) -> None:
+        """Close temporary transport objects created for file downloads."""
+        if not session:
+            return
+
+        cdn_client = session.get("cdn_client")
+        if cdn_client is not None:
+            try:
+                await cdn_client.disconnect()
+            except Exception:
+                pass
+
+        kind = session.get("kind")
+        if kind == "client":
+            try:
+                await session["client"].disconnect()
+            except Exception:
+                pass
+        elif kind == "sender":
+            sender = session.get("sender")
+            if sender is not None and sender is not self.client._sender:
+                try:
+                    await sender.disconnect()
+                except Exception:
+                    pass
+
+    async def _ensure_cdn_client(
+        self,
+        session: Dict[str, Any],
+        cdn_redirect: Any,
+    ) -> Any:
+        """Ensure this session has a connected Telethon client for CDN fetches."""
+        if (
+            session.get("cdn_client") is None
+            or session.get("cdn_dc_id") != cdn_redirect.dc_id
+        ):
+            if session.get("cdn_client") is not None:
+                await session["cdn_client"].disconnect()
+            session["cdn_client"] = await self.client._get_cdn_client(cdn_redirect)
+            session["cdn_dc_id"] = cdn_redirect.dc_id
+        return session["cdn_client"]
+
+    async def _refresh_document_file_reference(
+        self,
+        file_state: Dict[str, Any],
+        msg_data: Optional[Any],
+    ) -> None:
+        """Refresh an expired file reference in-place for long document downloads."""
+        async with file_state["lock"]:
+            location = file_state["location"]
+            if (
+                not msg_data
+                or not isinstance(location, types.InputDocumentFileLocation)
+                or location.thumb_size != ""
+            ):
+                raise RuntimeError("Cannot refresh file reference for this media")
+
+            chat, msg_id = msg_data
+            message = await self.client.get_messages(chat, ids=msg_id)
+            if not message or not isinstance(message.media, types.MessageMediaDocument):
+                raise RuntimeError("Unable to refetch message for file reference")
+
+            document = message.media.document
+            if not document or document.id != location.id:
+                raise RuntimeError("Refetched message no longer matches document")
+
+            location.file_reference = document.file_reference
+
+    async def _request_file_part(
+        self,
+        session: Dict[str, Any],
+        file_state: Dict[str, Any],
+        offset: int,
+        limit: int,
+        msg_data: Optional[Any],
+    ) -> bytes:
+        """Fetch a single file part, following CDN redirects and refreshing refs."""
+        timed_out = False
+
+        while True:
+            async with file_state["lock"]:
+                location = file_state["location"]
+                dc_id = file_state["dc_id"]
+                cdn_redirect = file_state.get("cdn_redirect")
+
+            if session.get("dc_id") != dc_id and session.get("kind") != "primary":
+                raise _SessionResetRequired()
+
+            try:
+                if cdn_redirect is not None:
+                    cdn_client = await self._ensure_cdn_client(session, cdn_redirect)
+                    request = functions.upload.GetCdnFileRequest(
+                        cdn_redirect.file_token,
+                        offset=offset,
+                        limit=limit,
+                    )
+                    result = await cdn_client._call(cdn_client._sender, request)
+                    if isinstance(result, types.upload.CdnFileReuploadNeeded):
+                        await self.client._call(
+                            self.client._sender,
+                            functions.upload.ReuploadCdnFileRequest(
+                                file_token=cdn_redirect.file_token,
+                                request_token=result.request_token,
+                            ),
+                        )
+                        continue
+
+                    data = result.bytes
+                    if cdn_redirect.encryption_key and cdn_redirect.encryption_iv:
+                        data = AES.decrypt_ige(
+                            data,
+                            cdn_redirect.encryption_key,
+                            cdn_redirect.encryption_iv,
+                        )
+                    return data
+
+                request = functions.upload.GetFileRequest(
+                    location,
+                    offset=offset,
+                    limit=limit,
+                )
+                result = await session["client"]._call(session["sender"], request)
+                if isinstance(result, types.upload.FileCdnRedirect):
+                    async with file_state["lock"]:
+                        file_state["cdn_redirect"] = result
+                    continue
+                return result.bytes
+
+            except errors.TimedOutError:
+                if timed_out:
+                    raise
+                timed_out = True
+                await asyncio.sleep(1)
+
+            except errors.FileMigrateError as exc:
+                async with file_state["lock"]:
+                    file_state["dc_id"] = exc.new_dc
+                raise _SessionResetRequired() from exc
+
+            except (
+                errors.FilerefUpgradeNeededError,
+                errors.FileReferenceExpiredError,
+            ) as exc:
+                await self._refresh_document_file_reference(file_state, msg_data)
+                timed_out = False
+                continue
+
+    async def _download_via_part_scheduler(
+        self,
+        message: Any,
+        media: Any,
+        file_size: int,
+        temp_path: Path,
+        final_path: Path,
+        filename: str,
+        *,
+        session_count: int,
+        pipeline_depth: int,
+        resume_event: Optional[asyncio.Event] = None,
+    ) -> Optional[Path]:
+        """Download a known-size file using Desktop-style pipelined part requests."""
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.unlink(missing_ok=True)
+
+        with open(temp_path, "wb") as fh:
+            if file_size > 0:
+                fh.seek(file_size - 1)
+                fh.write(b"\x00")
+
+        download_source = self._get_direct_download_source(message, media)
+        file_info = utils._get_file_info(download_source)
+        file_state: Dict[str, Any] = {
+            "location": file_info.location,
+            "dc_id": file_info.dc_id,
+            "cdn_redirect": None,
+            "lock": asyncio.Lock(),
+        }
+        msg_data = None
+        if hasattr(message, "input_chat") and getattr(message, "input_chat", None):
+            msg_data = (message.input_chat, message.id)
+
+        write_lock = asyncio.Lock()
+        offset_lock = asyncio.Lock()
+        bytes_done = 0
+        next_offset = 0
+        part_size = _CHUNK_SIZE
+        fh = open(temp_path, "r+b")
+
+        async def claim_offset() -> Optional[int]:
+            nonlocal next_offset
+            async with offset_lock:
+                if next_offset >= file_size:
+                    return None
+                result = next_offset
+                next_offset += part_size
+                return result
+
+        async def handle_part(offset: int, data: bytes) -> None:
+            nonlocal bytes_done
+            async with write_lock:
+                fh.seek(offset)
+                fh.write(data)
+                bytes_done += len(data)
+                self._emit_media_progress(filename, bytes_done, file_size)
+
+        async def worker(session_index: int) -> None:
+            session = await self._create_download_session(
+                file_info.dc_id,
+                session_index=session_index,
+            )
+            pending: Dict[asyncio.Task, int] = {}
+            try:
+                while not self._stop_requested:
+                    await self._wait_for_media_resume(resume_event)
+
+                    while (
+                        not self._stop_requested
+                        and len(pending) < pipeline_depth
+                    ):
+                        offset = await claim_offset()
+                        if offset is None:
+                            break
+                        limit = min(part_size, file_size - offset)
+                        task = asyncio.create_task(
+                            self._request_file_part(
+                                session,
+                                file_state,
+                                offset,
+                                limit,
+                                msg_data,
+                            )
+                        )
+                        pending[task] = offset
+
+                    if not pending:
+                        break
+
+                    done, _ = await asyncio.wait(
+                        pending.keys(),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        offset = pending.pop(task)
+                        try:
+                            data = task.result()
+                        except _SessionResetRequired:
+                            await self._close_download_session(session)
+                            async with file_state["lock"]:
+                                dc_id = file_state["dc_id"]
+                            session = await self._create_download_session(
+                                dc_id,
+                                session_index=session_index,
+                            )
+                            retry_limit = min(part_size, file_size - offset)
+                            retry_task = asyncio.create_task(
+                                self._request_file_part(
+                                    session,
+                                    file_state,
+                                    offset,
+                                    retry_limit,
+                                    msg_data,
+                                )
+                            )
+                            pending[retry_task] = offset
+                            continue
+                        await handle_part(offset, data)
+            finally:
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending.keys(), return_exceptions=True)
+                await self._close_download_session(session)
+
+        try:
+            workers = [
+                asyncio.create_task(worker(session_index))
+                for session_index in range(session_count)
+            ]
+            await asyncio.gather(*workers)
+        except Exception:
+            for task in locals().get("workers", []):
+                task.cancel()
+            if "workers" in locals():
+                await asyncio.gather(*workers, return_exceptions=True)
+            fh.close()
+            raise
+
+        fh.close()
+        if self._stop_requested or bytes_done < file_size:
+            return None
+        self._emit_media_progress(filename, file_size, file_size, force=True)
+        return self._finalize_media_download(temp_path, final_path, file_size)
+
     async def _download_small_media(
         self,
         message: Any,
@@ -507,53 +904,38 @@ class MediaMixin:
         filename: str,
         resume_event: Optional[asyncio.Event] = None,
     ) -> Optional[Path]:
-        """Download a smaller binary media file atomically via direct requests."""
-        temp_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.unlink(missing_ok=True)
+        """Download a smaller binary media file via the pipelined part scheduler."""
+        resolved_size = int(file_size or 0)
+        if resolved_size <= 0:
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.unlink(missing_ok=True)
 
-        download_source = self._get_direct_download_source(message, media)
-        file_info = utils._get_file_info(download_source)
-        resolved_size = int(file_size or file_info.size or 0)
-        msg_data = None
-        if hasattr(message, "input_chat") and getattr(message, "input_chat", None):
-            msg_data = (message.input_chat, message.id)
+            def progress_callback(done: int, total: int) -> None:
+                resolved_total = int(total or 0)
+                self._emit_media_progress(filename, int(done), resolved_total)
 
-        bytes_done = 0
-        stream = _DirectDownloadIter(
-            self.client,
-            None,
-            file=file_info.location,
-            dc_id=file_info.dc_id,
-            offset=0,
-            stride=_CHUNK_SIZE,
-            chunk_size=_CHUNK_SIZE,
-            request_size=_CHUNK_SIZE,
-            file_size=resolved_size,
-            msg_data=msg_data,
-        )
-
-        try:
-            with open(temp_path, "wb") as fh:
-                async for chunk in stream:
-                    await self._wait_for_media_resume(resume_event)
-                    if self._stop_requested:
-                        fh.flush()
-                        return None
-
-                    fh.write(chunk)
-                    bytes_done += len(chunk)
-                    self._emit_media_progress(filename, bytes_done, resolved_size)
-        finally:
-            await stream.close()
-
-        if resolved_size > 0 and bytes_done < resolved_size:
-            return None
-
-        if resolved_size > 0:
-            self._emit_media_progress(
-                filename, resolved_size, resolved_size, force=True
+            result = await self.client.download_media(
+                message,
+                file=temp_path,
+                progress_callback=progress_callback,
             )
-        return self._finalize_media_download(temp_path, final_path, resolved_size)
+            if not result:
+                return None
+            return self._finalize_media_download(temp_path, final_path, 0)
+
+        session_count = self._get_file_session_count(resolved_size, large=False)
+        pipeline_depth = self._get_pipeline_depth(resolved_size, large=False)
+        return await self._download_via_part_scheduler(
+            message,
+            media,
+            resolved_size,
+            temp_path,
+            final_path,
+            filename,
+            session_count=session_count,
+            pipeline_depth=pipeline_depth,
+            resume_event=resume_event,
+        )
 
     async def _wait_for_media_resume(
         self, resume_event: Optional[asyncio.Event] = None
@@ -723,103 +1105,23 @@ class MediaMixin:
         filename: str = "",
         resume_event: Optional[asyncio.Event] = None,
     ) -> Optional[Path]:
-        """Download a large file with parallel striped chunk requests."""
-        temp_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.unlink(missing_ok=True)
-
-        with open(temp_path, "wb") as f:
-            if file_size > 0:
-                f.seek(file_size - 1)
-                f.write(b"\x00")
-
-        bytes_done = 0
-        download_source = self._get_direct_download_source(
+        """Download a large file with multiple pipelined MTProto sessions."""
+        media = getattr(message, "media", None) or (
+            message.get("media") if isinstance(message, dict) else None
+        )
+        session_count = self._get_file_session_count(file_size, large=True)
+        pipeline_depth = self._get_pipeline_depth(file_size, large=True)
+        return await self._download_via_part_scheduler(
             message,
-            getattr(message, "media", None) or (
-                message.get("media") if isinstance(message, dict) else None
-            ),
+            media,
+            file_size,
+            temp_path,
+            dest_path,
+            filename,
+            session_count=session_count,
+            pipeline_depth=pipeline_depth,
+            resume_event=resume_event,
         )
-        file_info = utils._get_file_info(download_source)
-        input_location = file_info.location
-        dc_id = file_info.dc_id
-        msg_data = None
-        if hasattr(message, "input_chat") and getattr(message, "input_chat", None):
-            msg_data = (message.input_chat, message.id)
-
-        num_chunks = max(1, (file_size + _CHUNK_SIZE - 1) // _CHUNK_SIZE)
-        num_workers = max(
-            1,
-            min(
-                num_chunks,
-                int(
-                    getattr(self, "config", {})
-                    .get("settings", {})
-                    .get("large_file_workers", _LARGE_FILE_WORKERS)
-                    or _LARGE_FILE_WORKERS
-                ),
-            ),
-        )
-        stride = num_workers * _CHUNK_SIZE
-
-        fh = open(temp_path, "r+b")
-
-        async def fetch_and_write(worker_index: int) -> int:
-            nonlocal bytes_done
-            offset = worker_index * _CHUNK_SIZE
-            written_total = 0
-
-            while offset < file_size:
-                remaining_chunks = max(1, (file_size - offset + stride - 1) // stride)
-                await self._wait_for_media_resume(resume_event)
-                stream = _DirectDownloadIter(
-                    self.client,
-                    remaining_chunks,
-                    file=input_location,
-                    dc_id=dc_id,
-                    offset=offset,
-                    stride=stride,
-                    chunk_size=_CHUNK_SIZE,
-                    request_size=_CHUNK_SIZE,
-                    file_size=file_size,
-                    msg_data=msg_data,
-                )
-                try:
-                    async for chunk in stream:
-                        await self._wait_for_media_resume(resume_event)
-                        if self._stop_requested:
-                            return written_total
-
-                        fh.seek(offset)
-                        fh.write(chunk)
-                        offset += stride
-                        written_total += len(chunk)
-                        bytes_done += len(chunk)
-                        self._emit_media_progress(filename, bytes_done, file_size)
-                finally:
-                    await stream.close()
-                break
-
-            return written_total
-
-        try:
-            workers = [
-                asyncio.create_task(fetch_and_write(worker_index))
-                for worker_index in range(num_workers)
-            ]
-            await asyncio.gather(*workers)
-        except Exception:
-            for task in locals().get("workers", []):
-                task.cancel()
-            if "workers" in locals():
-                await asyncio.gather(*workers, return_exceptions=True)
-            fh.close()
-            raise
-
-        fh.close()
-        if self._stop_requested or bytes_done < file_size:
-            return None
-        self._emit_media_progress(filename, file_size, file_size, force=True)
-        return self._finalize_media_download(temp_path, dest_path, file_size)
 
     def _get_media_category(self, media: Any) -> str:
         """Return the category subdirectory name for a media object."""
