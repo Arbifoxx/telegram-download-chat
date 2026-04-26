@@ -529,6 +529,11 @@ class MediaMixin:
         if not self._media_transport_logs_enabled():
             return
 
+        noisy_events = {"PART"}
+        settings = getattr(self, "config", {}).get("settings", {})
+        if event in noisy_events and not settings.get("media_transport_part_logs", False):
+            return
+
         detail = ":".join(f"{key}={fields[key]}" for key in sorted(fields))
         if detail:
             self.logger.info(f"MEDIA_TRANSPORT_{event}:{filename}:{detail}")
