@@ -537,9 +537,14 @@ class MediaMixin:
         *,
         session_index: int,
     ) -> Dict[str, Any]:
-        """Create one transport session for pipelined file part downloads."""
+        """Create one transport session for pipelined file part downloads.
+
+        Telethon safely supports queueing many requests over one sender.
+        We prefer that over cloning extra clients/sessions, which proved
+        fragile across DC authorization states on some accounts/platforms.
+        """
         current_dc = int(getattr(self.client.session, "dc_id", 0) or 0)
-        if session_index == 0 and dc_id == current_dc:
+        if dc_id == current_dc:
             return {
                 "client": self.client,
                 "sender": self.client._sender,
@@ -549,83 +554,11 @@ class MediaMixin:
                 "cdn_dc_id": None,
             }
 
-        dc = await self.client._get_dc(dc_id)
-
-        if dc_id == current_dc:
-            session = await utils.maybe_async(self.client.session.clone())
-            temp_client = self.client.__class__(
-                session,
-                self.client.api_id,
-                self.client.api_hash,
-                connection=self.client._connection,
-                use_ipv6=getattr(self.client, "_use_ipv6", False),
-                proxy=self.client._proxy,
-                local_addr=self.client._local_addr,
-                timeout=self.client._timeout,
-                request_retries=self.client._request_retries,
-                connection_retries=self.client._connection_retries,
-                retry_delay=self.client._retry_delay,
-                auto_reconnect=self.client._auto_reconnect,
-                sequential_updates=self.client._sequential_updates,
-                flood_sleep_threshold=self.client.flood_sleep_threshold,
-                raise_last_call_error=self.client._raise_last_call_error,
-                loop=self.client.loop,
-                receive_updates=False,
-            )
-            temp_client.session.auth_key = self.client._sender.auth_key
-            await utils.maybe_async(temp_client.session.set_dc(dc.id, dc.ip_address, dc.port))
-            await temp_client.connect()
-            return {
-                "client": temp_client,
-                "sender": temp_client._sender,
-                "kind": "client",
-                "dc_id": dc_id,
-                "cdn_client": None,
-                "cdn_dc_id": None,
-            }
-
         borrowed_sender = await self.client._borrow_exported_sender(dc_id)
-        if session_index == 0:
-            return {
-                "client": self.client,
-                "sender": borrowed_sender,
-                "kind": "borrowed_sender",
-                "dc_id": dc_id,
-                "cdn_client": None,
-                "cdn_dc_id": None,
-            }
-
-        session = await utils.maybe_async(self.client.session.clone())
-        temp_client = self.client.__class__(
-            session,
-            self.client.api_id,
-            self.client.api_hash,
-            connection=self.client._connection,
-            use_ipv6=getattr(self.client, "_use_ipv6", False),
-            proxy=self.client._proxy,
-            local_addr=self.client._local_addr,
-            timeout=self.client._timeout,
-            request_retries=self.client._request_retries,
-            connection_retries=self.client._connection_retries,
-            retry_delay=self.client._retry_delay,
-            auto_reconnect=self.client._auto_reconnect,
-            sequential_updates=self.client._sequential_updates,
-            flood_sleep_threshold=self.client.flood_sleep_threshold,
-            raise_last_call_error=self.client._raise_last_call_error,
-            loop=self.client.loop,
-            receive_updates=False,
-        )
-        await utils.maybe_async(temp_client.session.set_dc(dc.id, dc.ip_address, dc.port))
-        temp_client.session.auth_key = borrowed_sender.auth_key
-        try:
-            await temp_client.connect()
-        finally:
-            await self.client._return_exported_sender(borrowed_sender)
-
         return {
-            "client": temp_client,
-            "sender": temp_client._sender,
-            "kind": "client",
+            "client": self.client,
+            "sender": borrowed_sender,
+            "kind": "borrowed_sender",
             "dc_id": dc_id,
             "cdn_client": None,
             "cdn_dc_id": None,
@@ -644,23 +577,11 @@ class MediaMixin:
                 pass
 
         kind = session.get("kind")
-        if kind == "client":
-            try:
-                await session["client"].disconnect()
-            except Exception:
-                pass
-        elif kind == "borrowed_sender":
+        if kind == "borrowed_sender":
             sender = session.get("sender")
             if sender is not None:
                 try:
                     await self.client._return_exported_sender(sender)
-                except Exception:
-                    pass
-        elif kind == "sender":
-            sender = session.get("sender")
-            if sender is not None and sender is not self.client._sender:
-                try:
-                    await sender.disconnect()
                 except Exception:
                     pass
 
