@@ -11,6 +11,16 @@ from PySide6.QtCore import QThread, Signal
 from telegram_download_chat.paths import get_downloads_dir
 
 
+def _get_local_source_dir() -> Path | None:
+    """Return the repo ``src`` directory when running from a checkout."""
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / "src" / "telegram_download_chat"
+        if candidate.exists():
+            return parent / "src"
+    return None
+
+
 class WorkerThread(QThread):
     """Worker thread for running command line tasks in the background."""
 
@@ -21,8 +31,8 @@ class WorkerThread(QThread):
     media_paused = Signal()
     media_resumed = Signal()
     media_manually_paused = Signal()
-    file_downloading = Signal(str, int)  # filename, total_bytes
-    file_progress = Signal(str, int, int)  # filename, bytes_done, total_bytes
+    file_downloading = Signal(str, object)  # filename, total_bytes
+    file_progress = Signal(str, object, object)  # filename, bytes_done, total_bytes
     file_done = Signal(str)  # filename
 
     def __init__(self, cmd_args, output_dir):
@@ -235,6 +245,16 @@ class WorkerThread(QThread):
             env = os.environ.copy()
             env.setdefault("PYTHONIOENCODING", "utf-8")
 
+            local_src = _get_local_source_dir()
+            if local_src:
+                existing_pythonpath = env.get("PYTHONPATH", "")
+                env["PYTHONPATH"] = (
+                    f"{local_src}{os.pathsep}{existing_pythonpath}"
+                    if existing_pythonpath
+                    else str(local_src)
+                )
+                self.log.emit(f"Using local source tree: {local_src}")
+
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -246,6 +266,7 @@ class WorkerThread(QThread):
                 bufsize=1,  # Line buffered
                 universal_newlines=True,
                 env=env,
+                cwd=str(local_src.parent) if local_src else None,
             )
 
             # Read output in real-time

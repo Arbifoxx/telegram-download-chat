@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-import random
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,7 +41,7 @@ _CAT_LOCATIONS = "locations"
 _CAT_POLLS = "polls"
 _CAT_OTHER = "other"
 
-_PARALLEL_THRESHOLD = 5 * 1024 * 1024  # parallelize files >= 5 MB
+_LARGE_FILE_THRESHOLD = 128 * 1024 * 1024  # stream/resume files >= 128 MB
 _CHUNK_SIZE = 512 * 1024               # 512 KB per request (Telegram's standard block)
 
 _ARCHIVE_MIMES = {
@@ -304,20 +303,26 @@ class MediaMixin:
 
         category = self._get_media_category(media)
         download_to = attachments_dir / category / f"{message_id}_{filename}"
+        file_size = self._get_media_file_size(media)
 
-        # Skip if already downloaded from a previous run
         if download_to.exists():
-            self.logger.debug(f"Skipping already-downloaded: {download_to}")
-            return download_to
+            if file_size > 0 and download_to.stat().st_size != file_size:
+                self.logger.warning(
+                    f"Existing media has wrong size, re-downloading: {download_to.name} "
+                    f"(expected {file_size}, got {download_to.stat().st_size})"
+                )
+                download_to.unlink(missing_ok=True)
+            else:
+                self.logger.debug(f"Skipping already-downloaded: {download_to}")
+                return download_to
 
         download_to.parent.mkdir(parents=True, exist_ok=True)
 
         settings = getattr(self, "config", {}).get("settings", {})
         max_retries = settings.get("max_retries", 5)
-        num_workers = settings.get("download_workers", 4)
 
-        file_size = self._get_media_file_size(media)
-        use_parallel = file_size >= _PARALLEL_THRESHOLD
+        use_resumable_stream = file_size >= _LARGE_FILE_THRESHOLD
+        temp_path = self._get_partial_media_path(download_to)
 
         unique_name = download_to.name  # "{message_id}_{filename}" — unique per message
         self.logger.info(f"MEDIA_DOWNLOADING:{unique_name}:{file_size}")
@@ -331,20 +336,24 @@ class MediaMixin:
                 if self._serialize_synthetic_media(media, download_to):
                     return download_to
 
-                if use_parallel:
-                    result = await self._download_parallel(
+                if use_resumable_stream:
+                    result = await self._download_large_media(
                         message,
                         file_size,
+                        temp_path,
                         download_to,
-                        num_workers,
                         unique_name,
                         resume_event=resume_event,
                     )
                 else:
-                    result = await self.client.download_media(
-                        message, file=download_to
+                    result = await self._download_small_media(
+                        message,
+                        file_size,
+                        temp_path,
+                        download_to,
+                        unique_name,
+                        resume_event=resume_event,
                     )
-                    result = Path(result) if result else None
 
                 if result:
                     self.logger.info(f"MEDIA_DOWNLOADED:{unique_name}")
@@ -399,6 +408,60 @@ class MediaMixin:
             f"Gave up downloading media for message {message_id} after flood waits"
         )
         return None
+
+    def _get_partial_media_path(self, final_path: Path) -> Path:
+        """Return the on-disk temp file path used for atomic/resumable downloads."""
+        return final_path.with_name(f"{final_path.name}.part")
+
+    def _finalize_media_download(
+        self,
+        temp_path: Path,
+        final_path: Path,
+        expected_size: int = 0,
+    ) -> Optional[Path]:
+        """Validate and atomically move a finished temp file into place."""
+        if not temp_path.exists():
+            return None
+
+        if expected_size > 0:
+            actual_size = temp_path.stat().st_size
+            if actual_size != expected_size:
+                raise IOError(
+                    f"Downloaded size mismatch for {final_path.name}: "
+                    f"expected {expected_size}, got {actual_size}"
+                )
+
+        temp_path.replace(final_path)
+        return final_path
+
+    async def _download_small_media(
+        self,
+        message: Any,
+        file_size: int,
+        temp_path: Path,
+        final_path: Path,
+        filename: str,
+        resume_event: Optional[asyncio.Event] = None,
+    ) -> Optional[Path]:
+        """Download a smaller binary media file atomically via Telethon."""
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.unlink(missing_ok=True)
+
+        def progress_callback(done: int, total: int) -> None:
+            resolved_total = int(total or file_size or 0)
+            self.logger.info(
+                f"MEDIA_FILE_PROGRESS:{filename}:{int(done)}:{resolved_total}"
+            )
+
+        result = await self.client.download_media(
+            message,
+            file=temp_path,
+            progress_callback=progress_callback,
+        )
+        if not result:
+            return None
+
+        return self._finalize_media_download(temp_path, final_path, file_size)
 
     async def _wait_for_media_resume(
         self, resume_event: Optional[asyncio.Event] = None
@@ -470,7 +533,7 @@ class MediaMixin:
             1,
             min(
                 CONCURRENCY,
-                int(settings.get("large_file_concurrency", 2) or 2),
+                int(settings.get("large_file_concurrency", 1) or 1),
             ),
         )
 
@@ -501,7 +564,7 @@ class MediaMixin:
                 )
                 file_size = self._get_media_file_size(media) if media else 0
 
-                if file_size >= _PARALLEL_THRESHOLD:
+                if file_size >= _LARGE_FILE_THRESHOLD:
                     async with large_file_semaphore:
                         path = await self.download_message_media(
                             msg, attachments_dir, resume_event=resume_event
@@ -515,6 +578,8 @@ class MediaMixin:
                     or (msg.get("id") if isinstance(msg, dict) else None)
                     or ""
                 )
+                if self._stop_requested:
+                    return
                 if path and msg_id:
                     try:
                         results[msg_id] = str(
@@ -550,110 +615,55 @@ class MediaMixin:
     # Private helpers
     # ------------------------------------------------------------------
 
-    async def _download_parallel(
+    async def _download_large_media(
         self,
         message: Any,
         file_size: int,
+        temp_path: Path,
         dest_path: Path,
-        num_workers: int,
         filename: str = "",
         resume_event: Optional[asyncio.Event] = None,
     ) -> Optional[Path]:
-        """Download a file with long-lived striped workers.
+        """Download a large file sequentially with temp-file resume support."""
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
 
-        Each worker keeps a single ``iter_download`` stream open and walks the
-        file in ``stride``-sized steps. This avoids reopening a fresh Telegram
-        download iterator for every chunk, which otherwise creates a huge amount
-        of sender setup/teardown churn during long batch downloads.
-        """
-        num_chunks = (file_size + _CHUNK_SIZE - 1) // _CHUNK_SIZE
-        num_workers = max(1, min(num_workers, num_chunks))
+        existing_size = temp_path.stat().st_size if temp_path.exists() else 0
+        if existing_size > file_size > 0:
+            temp_path.unlink(missing_ok=True)
+            existing_size = 0
 
-        with open(dest_path, "wb") as f:
-            f.seek(file_size - 1)
-            f.write(b"\x00")
+        if existing_size and file_size:
+            self.logger.info(
+                f"MEDIA_RESUMING:{filename}:{existing_size}:{file_size}"
+            )
 
-        fh = open(dest_path, "r+b")
-        bytes_done = 0
-        last_pct = -1
+        bytes_done = existing_size
+        msg_data = None
+        if hasattr(message, "input_chat") and getattr(message, "input_chat", None):
+            msg_data = (message.input_chat, message.id)
 
-        async def fetch_and_write(worker_index: int) -> int:
-            nonlocal bytes_done, last_pct
+        mode = "ab" if existing_size else "wb"
+        with open(temp_path, mode) as fh:
+            async for chunk in self.client._iter_download(
+                message,
+                offset=existing_size,
+                request_size=_CHUNK_SIZE,
+                chunk_size=_CHUNK_SIZE,
+                file_size=file_size,
+                msg_data=msg_data,
+            ):
+                await self._wait_for_media_resume(resume_event)
+                if self._stop_requested:
+                    fh.flush()
+                    return None
 
-            stride = num_workers * _CHUNK_SIZE
-            offset = worker_index * _CHUNK_SIZE
-            written_total = 0
-
-            while offset < file_size:
-                remaining_chunks = max(
-                    1,
-                    (file_size - offset + stride - 1) // stride,
+                fh.write(chunk)
+                bytes_done += len(chunk)
+                self.logger.info(
+                    f"MEDIA_FILE_PROGRESS:{filename}:{bytes_done}:{file_size}"
                 )
 
-                # Retry with random jitter so connection resets don't cause all
-                # workers to re-synchronise after a long-running transfer.
-                for attempt in range(8):
-                    try:
-                        await self._wait_for_media_resume(resume_event)
-                        async for chunk in self.client.iter_download(
-                            message,
-                            offset=offset,
-                            stride=stride,
-                            limit=remaining_chunks,
-                            chunk_size=_CHUNK_SIZE,
-                            request_size=_CHUNK_SIZE,
-                            file_size=file_size,
-                        ):
-                            await self._wait_for_media_resume(resume_event)
-                            if self._stop_requested:
-                                return written_total
-
-                            fh.seek(offset)
-                            fh.write(chunk)
-                            offset += stride
-                            written_total += len(chunk)
-                            bytes_done += len(chunk)
-
-                            if file_size > 0:
-                                pct = int(bytes_done / file_size * 100)
-                                if pct != last_pct:
-                                    last_pct = pct
-                                    self.logger.info(
-                                        f"MEDIA_FILE_PROGRESS:{filename}:{bytes_done}:{file_size}"
-                                    )
-                        break
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        if attempt < 7:
-                            await self._sleep_with_pause(
-                                random.uniform(0.05, 0.4) * (1.5 ** attempt),
-                                resume_event,
-                            )
-                        else:
-                            raise
-                else:
-                    break
-
-            return written_total
-
-        try:
-            workers = [
-                asyncio.create_task(fetch_and_write(worker_index))
-                for worker_index in range(num_workers)
-            ]
-            await asyncio.gather(*workers)
-        except Exception:
-            for task in locals().get("workers", []):
-                task.cancel()
-            if "workers" in locals():
-                await asyncio.gather(*workers, return_exceptions=True)
-            fh.close()
-            dest_path.unlink(missing_ok=True)
-            raise
-
-        fh.close()
-        return dest_path
+        return self._finalize_media_download(temp_path, dest_path, file_size)
 
     def _get_media_category(self, media: Any) -> str:
         """Return the category subdirectory name for a media object."""

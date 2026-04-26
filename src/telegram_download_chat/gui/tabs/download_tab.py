@@ -536,6 +536,17 @@ class DownloadTab(QWidget):
     def show_resume_button(self, visible: bool):
         self.resume_btn.setVisible(visible)
 
+    def _format_bytes(self, value: int) -> str:
+        size = float(max(0, value))
+        units = ["B", "KB", "MB", "GB", "TB"]
+        unit_index = 0
+        while size >= 1024 and unit_index < len(units) - 1:
+            size /= 1024
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(size)} {units[unit_index]}"
+        return f"{size:.1f} {units[unit_index]}"
+
     def update_file_info(self, filename: str, total_bytes: int):
         """Add a progress row for a file that has started downloading."""
         if not filename or filename in self._file_rows:
@@ -552,9 +563,9 @@ class DownloadTab(QWidget):
         bar.setTextVisible(True)
         bar.setFixedHeight(16)
         if total_bytes > 0:
-            bar.setRange(0, total_bytes)
+            bar.setRange(0, 1000)
             bar.setValue(0)
-            bar.setFormat("0%")
+            bar.setFormat(f"0.0% · 0 B / {self._format_bytes(total_bytes)}")
         else:
             bar.setRange(0, 0)  # indeterminate
             bar.setFormat("")
@@ -566,7 +577,7 @@ class DownloadTab(QWidget):
         row_layout.addWidget(bar)
 
         self._file_panel_layout.addWidget(row)
-        self._file_rows[filename] = (row, label, bar)
+        self._file_rows[filename] = (row, label, bar, total_bytes)
         self._file_panel.setVisible(True)
         self._file_panel.adjustSize()
         if self._file_panel.parent():
@@ -577,11 +588,15 @@ class DownloadTab(QWidget):
         entry = self._file_rows.get(filename)
         if not entry or total_bytes <= 0:
             return
-        _, _, bar = entry
-        bar.setRange(0, total_bytes)
-        bar.setValue(bytes_done)
-        pct = int(bytes_done / total_bytes * 100)
-        bar.setFormat(f"{pct}%")
+        _, _, bar, _ = entry
+        clamped_done = min(max(0, int(bytes_done)), int(total_bytes))
+        scaled_value = min(1000, int(clamped_done * 1000 / total_bytes))
+        bar.setRange(0, 1000)
+        bar.setValue(scaled_value)
+        pct = clamped_done / total_bytes * 100
+        bar.setFormat(
+            f"{pct:.1f}% · {self._format_bytes(clamped_done)} / {self._format_bytes(total_bytes)}"
+        )
 
     def mark_file_done(self, filename: str):
         """Mark a file's row as complete and remove it after a short delay."""
