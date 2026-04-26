@@ -305,7 +305,8 @@ class MediaMixin:
         )
         use_parallel = file_size >= _PARALLEL_THRESHOLD
 
-        self.logger.info(f"MEDIA_DOWNLOADING:{filename}:{file_size}")
+        unique_name = download_to.name  # "{message_id}_{filename}" — unique per message
+        self.logger.info(f"MEDIA_DOWNLOADING:{unique_name}:{file_size}")
 
         for attempt in range(max_retries + 1):
             try:
@@ -318,7 +319,7 @@ class MediaMixin:
                         file_size,
                         download_to,
                         num_workers,
-                        filename,
+                        unique_name,
                     )
                 else:
                     result = await self.client.download_media(
@@ -327,7 +328,7 @@ class MediaMixin:
                     result = Path(result) if result else None
 
                 if result:
-                    self.logger.info(f"MEDIA_DOWNLOADED:{filename}")
+                    self.logger.info(f"MEDIA_DOWNLOADED:{unique_name}")
                     self.logger.debug(
                         f"Downloaded media for message {message_id}: {result}"
                     )

@@ -568,6 +568,9 @@ class DownloadTab(QWidget):
         self._file_panel_layout.addWidget(row)
         self._file_rows[filename] = (row, label, bar)
         self._file_panel.setVisible(True)
+        self._file_panel.adjustSize()
+        if self._file_panel.parent():
+            self._file_panel.parent().adjustSize()
 
     def update_file_progress(self, filename: str, bytes_done: int, total_bytes: int):
         """Update a file's progress bar."""
@@ -912,6 +915,7 @@ class DownloadTab(QWidget):
         if in_progress:
             self._is_manually_paused = False
             self.pause_btn.setText("Pause")
+            self._clear_file_panel()
             self.progress.setVisible(True)
             self.progress.setMaximum(0)  # Indeterminate mode
             self.progress.setFormat("Downloading...")
