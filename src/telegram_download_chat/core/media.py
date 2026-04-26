@@ -573,16 +573,8 @@ class MediaMixin:
                 receive_updates=False,
             )
             temp_client.session.auth_key = self.client._sender.auth_key
-            await temp_client._sender.connect(
-                self.client._connection(
-                    dc.ip_address,
-                    dc.port,
-                    dc.id,
-                    loggers=self.client._log,
-                    proxy=self.client._proxy,
-                    local_addr=self.client._local_addr,
-                )
-            )
+            await utils.maybe_async(temp_client.session.set_dc(dc.id, dc.ip_address, dc.port))
+            await temp_client.connect()
             return {
                 "client": temp_client,
                 "sender": temp_client._sender,
@@ -623,18 +615,10 @@ class MediaMixin:
             loop=self.client.loop,
             receive_updates=False,
         )
+        await utils.maybe_async(temp_client.session.set_dc(dc.id, dc.ip_address, dc.port))
         temp_client.session.auth_key = borrowed_sender.auth_key
         try:
-            await temp_client._sender.connect(
-                self.client._connection(
-                    dc.ip_address,
-                    dc.port,
-                    dc.id,
-                    loggers=self.client._log,
-                    proxy=self.client._proxy,
-                    local_addr=self.client._local_addr,
-                )
-            )
+            await temp_client.connect()
         finally:
             await self.client._return_exported_sender(borrowed_sender)
 
