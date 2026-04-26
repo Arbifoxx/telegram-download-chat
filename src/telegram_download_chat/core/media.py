@@ -549,6 +549,8 @@ class MediaMixin:
                 "cdn_dc_id": None,
             }
 
+        dc = await self.client._get_dc(dc_id)
+
         if dc_id == current_dc:
             session = await utils.maybe_async(self.client.session.clone())
             temp_client = self.client.__class__(
@@ -571,7 +573,6 @@ class MediaMixin:
                 receive_updates=False,
             )
             temp_client.session.auth_key = self.client._sender.auth_key
-            dc = await self.client._get_dc(dc_id)
             await temp_client._sender.connect(
                 self.client._connection(
                     dc.ip_address,
@@ -591,11 +592,56 @@ class MediaMixin:
                 "cdn_dc_id": None,
             }
 
-        sender = await self.client._create_exported_sender(dc_id)
+        borrowed_sender = await self.client._borrow_exported_sender(dc_id)
+        if session_index == 0:
+            return {
+                "client": self.client,
+                "sender": borrowed_sender,
+                "kind": "borrowed_sender",
+                "dc_id": dc_id,
+                "cdn_client": None,
+                "cdn_dc_id": None,
+            }
+
+        session = await utils.maybe_async(self.client.session.clone())
+        temp_client = self.client.__class__(
+            session,
+            self.client.api_id,
+            self.client.api_hash,
+            connection=self.client._connection,
+            use_ipv6=getattr(self.client, "_use_ipv6", False),
+            proxy=self.client._proxy,
+            local_addr=self.client._local_addr,
+            timeout=self.client._timeout,
+            request_retries=self.client._request_retries,
+            connection_retries=self.client._connection_retries,
+            retry_delay=self.client._retry_delay,
+            auto_reconnect=self.client._auto_reconnect,
+            sequential_updates=self.client._sequential_updates,
+            flood_sleep_threshold=self.client.flood_sleep_threshold,
+            raise_last_call_error=self.client._raise_last_call_error,
+            loop=self.client.loop,
+            receive_updates=False,
+        )
+        temp_client.session.auth_key = borrowed_sender.auth_key
+        try:
+            await temp_client._sender.connect(
+                self.client._connection(
+                    dc.ip_address,
+                    dc.port,
+                    dc.id,
+                    loggers=self.client._log,
+                    proxy=self.client._proxy,
+                    local_addr=self.client._local_addr,
+                )
+            )
+        finally:
+            await self.client._return_exported_sender(borrowed_sender)
+
         return {
-            "client": self.client,
-            "sender": sender,
-            "kind": "sender",
+            "client": temp_client,
+            "sender": temp_client._sender,
+            "kind": "client",
             "dc_id": dc_id,
             "cdn_client": None,
             "cdn_dc_id": None,
@@ -619,6 +665,13 @@ class MediaMixin:
                 await session["client"].disconnect()
             except Exception:
                 pass
+        elif kind == "borrowed_sender":
+            sender = session.get("sender")
+            if sender is not None:
+                try:
+                    await self.client._return_exported_sender(sender)
+                except Exception:
+                    pass
         elif kind == "sender":
             sender = session.get("sender")
             if sender is not None and sender is not self.client._sender:
