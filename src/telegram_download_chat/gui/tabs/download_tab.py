@@ -881,27 +881,6 @@ class DownloadTab(QWidget):
                 "The download failed. Please check the log for details.",
             )
 
-    def update_progress(self, current: int, total: int):
-        """Update the progress bar with download progress.
-
-        Args:
-            current: Current progress value
-            total: Total value for completion
-        """
-        if not self.progress.isVisible():
-            self.progress.setVisible(True)
-
-        if total > 0:
-            self.progress.setMaximum(total)
-            self.progress.setValue(current)
-            self.progress.setFormat(
-                f"Downloading... {current}/{total} ({current/total*100:.1f}%)"
-            )
-        else:
-            # Indeterminate mode
-            self.progress.setMaximum(0)
-            self.progress.setFormat("Downloading...")
-
     def _set_download_in_progress(self, in_progress: bool):
         """Update UI elements based on download state.
 

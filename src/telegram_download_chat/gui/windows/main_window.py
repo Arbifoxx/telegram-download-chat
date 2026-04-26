@@ -551,32 +551,6 @@ class MainWindow(QMainWindow):
         status = "Authenticated" if is_authenticated else "Logged out"
         self.status_bar.showMessage(f"Telegram: {status}", 3000)
 
-    def closeEvent(self, event: QCloseEvent):
-        """Handle window close event.
-
-        Args:
-            event: Close event
-        """
-        # Stop any running worker thread
-        if (
-            hasattr(self, "worker_thread")
-            and self.worker_thread
-            and self.worker_thread.isRunning()
-        ):
-            self.log_viewer.append("\nStopping download before exit...")
-            self.status_bar.showMessage("Stopping download before exit...")
-            self.worker_thread.stop()
-            self.worker_thread.wait(3000)  # Wait up to 3 seconds for thread to finish
-
-        # Save settings
-        self._save_settings()
-
-        # Emit about_to_close signal
-        self.about_to_close.emit()
-
-        # Accept the close event
-        event.accept()
-
     def _toggle_log_visibility(self, visible: bool):
         """Toggle log viewer visibility.
 

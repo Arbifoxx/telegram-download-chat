@@ -30,3 +30,5 @@ class TelegramChatDownloader(
         self._self_name: Optional[str] = None
         self._stop_requested = False
         self._stop_file = None
+        self._pause_file = None
+        self._manual_pause_logged = False

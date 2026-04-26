@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -259,6 +260,7 @@ class MediaMixin:
         self,
         message: Any,
         attachments_dir: Path,
+        resume_event: Optional[asyncio.Event] = None,
     ) -> Optional[Path]:
         """Download media from a single message into a category subdirectory.
 
@@ -310,6 +312,10 @@ class MediaMixin:
 
         for attempt in range(max_retries + 1):
             try:
+                await self._wait_for_media_resume(resume_event)
+                if self._stop_requested:
+                    return None
+
                 if self._serialize_synthetic_media(media, download_to):
                     return download_to
 
@@ -320,6 +326,7 @@ class MediaMixin:
                         download_to,
                         num_workers,
                         unique_name,
+                        resume_event=resume_event,
                     )
                 else:
                     result = await self.client.download_media(
@@ -350,7 +357,7 @@ class MediaMixin:
                             message = fresh[0]
                     except Exception:
                         pass
-                await asyncio.sleep(1)
+                await self._sleep_with_pause(1, resume_event)
 
             except FloodWaitError as e:
                 wait = e.seconds + 1
@@ -358,7 +365,7 @@ class MediaMixin:
                     f"Flood-wait {wait}s for message {message_id} "
                     f"(attempt {attempt + 1}/{max_retries + 1}), sleeping..."
                 )
-                await asyncio.sleep(wait)
+                await self._sleep_with_pause(wait, resume_event)
 
             except Exception as e:
                 if attempt < max_retries:
@@ -368,7 +375,7 @@ class MediaMixin:
                         f"failed for message {message_id}: {e}. "
                         f"Retrying in {backoff}s..."
                     )
-                    await asyncio.sleep(backoff)
+                    await self._sleep_with_pause(backoff, resume_event)
                 else:
                     self.logger.warning(
                         f"Failed to download media for message {message_id} "
@@ -380,6 +387,42 @@ class MediaMixin:
             f"Gave up downloading media for message {message_id} after flood waits"
         )
         return None
+
+    async def _wait_for_media_resume(
+        self, resume_event: Optional[asyncio.Event] = None
+    ) -> None:
+        """Block while automatic or manual media pause is active."""
+        if resume_event is not None:
+            await resume_event.wait()
+
+        while not self._stop_requested:
+            pause_file = getattr(self, "_pause_file", None)
+            if not pause_file or not pause_file.exists():
+                if getattr(self, "_manual_pause_logged", False):
+                    self._manual_pause_logged = False
+                    self.logger.info("MEDIA_RESUMED")
+                return
+
+            if not getattr(self, "_manual_pause_logged", False):
+                self._manual_pause_logged = True
+                self.logger.info("MEDIA_MANUALLY_PAUSED")
+
+            await asyncio.sleep(0.2)
+            if resume_event is not None:
+                await resume_event.wait()
+
+    async def _sleep_with_pause(
+        self,
+        seconds: float,
+        resume_event: Optional[asyncio.Event] = None,
+    ) -> None:
+        """Sleep in short slices so pause/stop requests take effect quickly."""
+        remaining = max(0.0, float(seconds))
+        while remaining > 0 and not self._stop_requested:
+            await self._wait_for_media_resume(resume_event)
+            chunk = min(0.25, remaining)
+            await asyncio.sleep(chunk)
+            remaining -= chunk
 
     async def _media_pause(self, resume_event: asyncio.Event) -> None:
         pause_file = Path(tempfile.gettempdir()) / f"tdc_media_pause_{os.getpid()}.tmp"
@@ -426,22 +469,16 @@ class MediaMixin:
             nonlocal completed, consecutive_errors
             if self._stop_requested:
                 return
-            await resume_event.wait()
-            if self._stop_requested:
-                return
-            # Manual pause: poll until the pause file disappears
-            if self._pause_file and self._pause_file.exists():
-                self.logger.info("MEDIA_MANUALLY_PAUSED")
-                while self._pause_file and self._pause_file.exists() and not self._stop_requested:
-                    await asyncio.sleep(0.5)
-                if not self._stop_requested:
-                    self.logger.info("MEDIA_RESUMED")
+            await self._wait_for_media_resume(resume_event)
             if self._stop_requested:
                 return
             async with semaphore:
+                await self._wait_for_media_resume(resume_event)
                 if self._stop_requested:
                     return
-                path = await self.download_message_media(msg, attachments_dir)
+                path = await self.download_message_media(
+                    msg, attachments_dir, resume_event=resume_event
+                )
                 msg_id = str(
                     getattr(msg, "id", None)
                     or (msg.get("id") if isinstance(msg, dict) else None)
@@ -489,17 +526,17 @@ class MediaMixin:
         dest_path: Path,
         num_workers: int,
         filename: str = "",
+        resume_event: Optional[asyncio.Event] = None,
     ) -> Optional[Path]:
-        """Download a file with a sliding window of concurrent chunk requests.
+        """Download a file with long-lived striped workers.
 
-        Keeps exactly num_workers chunk requests in flight at all times. As
-        soon as any request completes the next chunk fires immediately, so
-        completions are always staggered in real time. This is robust against
-        individual connection resets (e.g. exported DC auth expiry after ~5
-        min): the other in-flight requests keep the pipe full while one slot
-        reconnects, so no synchronised stall can form.
+        Each worker keeps a single ``iter_download`` stream open and walks the
+        file in ``stride``-sized steps. This avoids reopening a fresh Telegram
+        download iterator for every chunk, which otherwise creates a huge amount
+        of sender setup/teardown churn during long batch downloads.
         """
         num_chunks = (file_size + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        num_workers = max(1, min(num_workers, num_chunks))
 
         with open(dest_path, "wb") as f:
             f.seek(file_size - 1)
@@ -509,47 +546,77 @@ class MediaMixin:
         bytes_done = 0
         last_pct = -1
 
-        async def fetch_and_write(idx: int) -> int:
-            offset = idx * _CHUNK_SIZE
-            async for chunk in self.client.iter_download(
-                message,
-                offset=offset,
-                request_size=_CHUNK_SIZE,
-            ):
-                fh.seek(offset)
-                fh.write(chunk)
-                return len(chunk)
-            return 0
+        async def fetch_and_write(worker_index: int) -> int:
+            nonlocal bytes_done, last_pct
+
+            stride = num_workers * _CHUNK_SIZE
+            offset = worker_index * _CHUNK_SIZE
+            written_total = 0
+
+            while offset < file_size:
+                remaining_chunks = max(
+                    1,
+                    (file_size - offset + stride - 1) // stride,
+                )
+
+                # Retry with random jitter so connection resets don't cause all
+                # workers to re-synchronise after a long-running transfer.
+                for attempt in range(8):
+                    try:
+                        await self._wait_for_media_resume(resume_event)
+                        async for chunk in self.client.iter_download(
+                            message,
+                            offset=offset,
+                            stride=stride,
+                            limit=remaining_chunks,
+                            chunk_size=_CHUNK_SIZE,
+                            request_size=_CHUNK_SIZE,
+                            file_size=file_size,
+                        ):
+                            await self._wait_for_media_resume(resume_event)
+                            if self._stop_requested:
+                                return written_total
+
+                            fh.seek(offset)
+                            fh.write(chunk)
+                            offset += stride
+                            written_total += len(chunk)
+                            bytes_done += len(chunk)
+
+                            if file_size > 0:
+                                pct = int(bytes_done / file_size * 100)
+                                if pct != last_pct:
+                                    last_pct = pct
+                                    self.logger.info(
+                                        f"MEDIA_FILE_PROGRESS:{filename}:{bytes_done}:{file_size}"
+                                    )
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if attempt < 7:
+                            await self._sleep_with_pause(
+                                random.uniform(0.05, 0.4) * (1.5 ** attempt),
+                                resume_event,
+                            )
+                        else:
+                            raise
+                else:
+                    break
+
+            return written_total
 
         try:
-            pending: set = set()
-            next_idx = 0
-
-            while next_idx < min(num_workers, num_chunks):
-                pending.add(asyncio.create_task(fetch_and_write(next_idx)))
-                next_idx += 1
-
-            while pending:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in done:
-                    exc = task.exception()
-                    if exc:
-                        raise exc
-                    written = task.result() or 0
-                    bytes_done += written
-                    if file_size > 0:
-                        pct = int(bytes_done / file_size * 100)
-                        if pct != last_pct:
-                            last_pct = pct
-                            self.logger.info(
-                                f"MEDIA_FILE_PROGRESS:{filename}:{bytes_done}:{file_size}"
-                            )
-                    if next_idx < num_chunks:
-                        pending.add(asyncio.create_task(fetch_and_write(next_idx)))
-                        next_idx += 1
+            workers = [
+                asyncio.create_task(fetch_and_write(worker_index))
+                for worker_index in range(num_workers)
+            ]
+            await asyncio.gather(*workers)
         except Exception:
+            for task in locals().get("workers", []):
+                task.cancel()
+            if "workers" in locals():
+                await asyncio.gather(*workers, return_exceptions=True)
             fh.close()
             dest_path.unlink(missing_ok=True)
             raise
