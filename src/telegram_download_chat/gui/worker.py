@@ -18,6 +18,8 @@ class WorkerThread(QThread):
     progress = Signal(int, int)  # current, maximum
     status_update = Signal(str)  # parsed status for status bar
     finished = Signal(list, bool)  # files, was_stopped_by_user
+    media_paused = Signal()
+    media_resumed = Signal()
 
     def __init__(self, cmd_args, output_dir):
         """Initialize the worker thread.
@@ -34,6 +36,16 @@ class WorkerThread(QThread):
         self._stopped_by_user = False
         self.process = None
         self._stop_file = None  # Path to stop file for inter-process communication
+        self._pause_file: Path | None = None
+
+    def resume(self):
+        """Resume media downloads after a rate-limit pause."""
+        if self._pause_file and self._pause_file.exists():
+            try:
+                self._pause_file.unlink()
+            except Exception:
+                pass
+        self._pause_file = None
 
     def stop(self):
         """Stop the worker thread gracefully."""
@@ -82,6 +94,20 @@ class WorkerThread(QThread):
             self.status_update.emit("Rate limited, waiting...")
         elif "downloading media" in lower:
             self.status_update.emit("Downloading media...")
+        elif "media_paused:" in lower:
+            marker = "MEDIA_PAUSED:"
+            idx = line.upper().find(marker)
+            if idx != -1:
+                raw = line[idx + len(marker):]
+                pause_path = raw.split()[0] if raw.split() else ""
+                if pause_path:
+                    self._pause_file = Path(pause_path)
+            self.status_update.emit("Media downloads paused (rate limited)")
+            self.media_paused.emit()
+        elif "media_resumed" in lower:
+            self._pause_file = None
+            self.status_update.emit("Media downloads resumed")
+            self.media_resumed.emit()
 
     def _extract_progress(self, line):
         """Extract progress information from command output.

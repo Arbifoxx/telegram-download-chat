@@ -35,6 +35,9 @@ class DownloadTab(QWidget):
     # Signal emitted when the download is stopped
     download_stopped = Signal()
 
+    # Signal emitted when the user clicks Resume after a rate-limit pause
+    download_resumed = Signal()
+
     def __init__(self, parent=None):
         """Initialize the download tab.
 
@@ -380,6 +383,33 @@ class DownloadTab(QWidget):
         )
         btn_layout.addWidget(self.stop_btn)
 
+        # Resume button — shown only while media downloads are paused
+        self.resume_btn = QPushButton("Resume Downloads")
+        self.resume_btn.setFixedHeight(40)
+        self.resume_btn.setCursor(Qt.PointingHandCursor)
+        self.resume_btn.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                font-weight: bold;
+                padding: 8px 16px;
+                min-width: 140px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+            QPushButton:pressed {
+                background-color: #E65100;
+                padding: 9px 15px 7px 17px;
+            }
+        """
+        )
+        self.resume_btn.hide()
+        btn_layout.addWidget(self.resume_btn)
+
         # Add stretch to push buttons to the left
         btn_layout.addStretch()
 
@@ -437,7 +467,15 @@ class DownloadTab(QWidget):
         self.settings_tree.clicked.connect(self.toggle_settings_visibility)
         self.start_btn.clicked.connect(self.start_download)
         self.stop_btn.clicked.connect(self.stop_download)
+        self.resume_btn.clicked.connect(self._on_resume_clicked)
         self.chat_edit.returnPressed.connect(self.start_download)
+
+    def _on_resume_clicked(self):
+        self.resume_btn.hide()
+        self.download_resumed.emit()
+
+    def show_resume_button(self, visible: bool):
+        self.resume_btn.setVisible(visible)
 
     def _load_settings(self):
         """Load settings from config."""

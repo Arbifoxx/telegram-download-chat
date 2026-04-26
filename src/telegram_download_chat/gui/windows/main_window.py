@@ -180,6 +180,7 @@ class MainWindow(QMainWindow):
         # Connect download tab signals
         self.download_tab.download_started.connect(self._start_download)
         self.download_tab.download_stopped.connect(self._stop_download)
+        self.download_tab.download_resumed.connect(self._resume_download)
 
         # Connect convert tab signals
         self.convert_tab.conversion_started.connect(self._start_conversion)
@@ -319,6 +320,12 @@ class MainWindow(QMainWindow):
             self.worker_thread.progress.connect(self._on_worker_progress)
             self.worker_thread.status_update.connect(self.status_bar.showMessage)
             self.worker_thread.finished.connect(self._on_worker_finished)
+            self.worker_thread.media_paused.connect(
+                lambda: self.download_tab.show_resume_button(True)
+            )
+            self.worker_thread.media_resumed.connect(
+                lambda: self.download_tab.show_resume_button(False)
+            )
 
             # Update UI
             self.status_bar.showMessage("Downloading...")
@@ -331,6 +338,11 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Error: {str(e)}", 5000)
             self.download_tab.start_btn.setEnabled(True)
             self.download_tab.stop_btn.setEnabled(False)
+
+    def _resume_download(self):
+        """Resume media downloads after a rate-limit pause."""
+        if self.worker_thread and self.worker_thread.isRunning():
+            self.worker_thread.resume()
 
     def _stop_download(self):
         """Stop the current download process."""
@@ -463,6 +475,7 @@ class MainWindow(QMainWindow):
         self.download_tab._set_download_in_progress(False)
         self.download_tab.start_btn.setEnabled(True)
         self.download_tab.stop_btn.setEnabled(False)
+        self.download_tab.show_resume_button(False)
 
         # Update file list
         if files:

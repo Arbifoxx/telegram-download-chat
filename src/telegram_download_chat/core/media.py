@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from telethon.errors import FloodWaitError
+from telethon.errors import FileReferenceExpiredError, FloodWaitError
 from telethon.tl.types import (
     Document,
     DocumentAttributeFilename,
@@ -331,6 +333,19 @@ class MediaMixin:
                     )
                     return None
 
+            except FileReferenceExpiredError:
+                peer_id = getattr(message, "peer_id", None)
+                if peer_id is not None and attempt < max_retries:
+                    try:
+                        fresh = await self.client.get_messages(
+                            peer_id, ids=[int(message_id)]
+                        )
+                        if fresh:
+                            message = fresh[0]
+                    except Exception:
+                        pass
+                await asyncio.sleep(1)
+
             except FloodWaitError as e:
                 wait = e.seconds + 1
                 self.logger.info(
@@ -360,6 +375,23 @@ class MediaMixin:
         )
         return None
 
+    async def _media_pause(self, resume_event: asyncio.Event) -> None:
+        pause_file = Path(tempfile.gettempdir()) / f"tdc_media_pause_{os.getpid()}.tmp"
+        pause_file.touch()
+        self.logger.info(
+            f"MEDIA_PAUSED:{pause_file}  "
+            "— too many download failures. "
+            "Resume from the GUI or delete this file to continue."
+        )
+        try:
+            while pause_file.exists() and not self._stop_requested:
+                await asyncio.sleep(0.5)
+        finally:
+            pause_file.unlink(missing_ok=True)
+        if not self._stop_requested:
+            self.logger.info("MEDIA_RESUMED")
+            resume_event.set()
+
     async def download_all_media(
         self,
         messages: List[Any],
@@ -372,14 +404,23 @@ class MediaMixin:
         """
         settings = getattr(self, "config", {}).get("settings", {})
         CONCURRENCY = settings.get("download_concurrency", 5)
+        ERROR_THRESHOLD = settings.get("media_error_threshold", 5)
+
         semaphore = asyncio.Semaphore(CONCURRENCY)
+        resume_event = asyncio.Event()
+        resume_event.set()
+
         results: Dict[str, str] = {}
         total = len(messages)
         completed = 0
+        consecutive_errors = 0
         log_interval = max(1, min(50, total // 10))
 
         async def download_one(msg: Any) -> None:
-            nonlocal completed
+            nonlocal completed, consecutive_errors
+            if self._stop_requested:
+                return
+            await resume_event.wait()
             if self._stop_requested:
                 return
             async with semaphore:
@@ -398,6 +439,14 @@ class MediaMixin:
                         ).replace("\\", "/")
                     except ValueError:
                         results[msg_id] = str(path)
+                    consecutive_errors = 0
+                else:
+                    consecutive_errors += 1
+                    if consecutive_errors >= ERROR_THRESHOLD:
+                        consecutive_errors = 0
+                        resume_event.clear()
+                        await self._media_pause(resume_event)
+
                 completed += 1
                 if completed % log_interval == 0 or completed == total:
                     pct = int(completed / total * 100)
