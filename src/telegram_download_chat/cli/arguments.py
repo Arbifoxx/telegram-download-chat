@@ -42,6 +42,7 @@ class CLIOptions:
     download_concurrency: Optional[int] = None
     large_file_concurrency: Optional[int] = None
     media_progress_logs: bool = False
+    media_transport_logs: bool = False
 
 
 def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
@@ -204,6 +205,12 @@ def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
         dest="media_progress_logs",
         action="store_true",
         help="Emit per-file media progress markers to the log/stdout",
+    )
+    parser.add_argument(
+        "--media-transport-logs",
+        dest="media_transport_logs",
+        action="store_true",
+        help="Emit media transport timing diagnostics to the log/stdout",
     )
 
     args = parser.parse_args(argv)

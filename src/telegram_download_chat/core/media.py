@@ -49,6 +49,8 @@ _CHUNK_SIZE = 128 * 1024               # Telegram Desktop uses 128 KB file parts
 _LARGE_FILE_WORKERS = 8
 _DEFAULT_FILE_SESSIONS = 4
 _DEFAULT_PIPELINE_DEPTH = 4
+_MAX_SINGLE_SENDER_INFLIGHT_SMALL = 8
+_MAX_SINGLE_SENDER_INFLIGHT_LARGE = 16
 
 _ARCHIVE_MIMES = {
     "application/zip",
@@ -512,6 +514,27 @@ class MediaMixin:
             state[filename] = {"time": now, "bytes": bytes_done, "pct": pct}
             self._media_progress_state = state
 
+    def _media_transport_logs_enabled(self) -> bool:
+        """Return True when transport timing diagnostics are enabled."""
+        settings = getattr(self, "config", {}).get("settings", {})
+        return bool(settings.get("media_transport_logs", False))
+
+    def _emit_media_transport_event(
+        self,
+        filename: str,
+        event: str,
+        **fields: Any,
+    ) -> None:
+        """Emit a structured transport diagnostic log line."""
+        if not self._media_transport_logs_enabled():
+            return
+
+        detail = ":".join(f"{key}={fields[key]}" for key in sorted(fields))
+        if detail:
+            self.logger.info(f"MEDIA_TRANSPORT_{event}:{filename}:{detail}")
+        else:
+            self.logger.info(f"MEDIA_TRANSPORT_{event}:{filename}")
+
     def _finalize_media_download(
         self,
         temp_path: Path,
@@ -638,6 +661,7 @@ class MediaMixin:
         offset: int,
         limit: int,
         msg_data: Optional[Any],
+        filename: str,
     ) -> bytes:
         """Fetch a single file part, following CDN redirects and refreshing refs."""
         timed_out = False
@@ -652,6 +676,7 @@ class MediaMixin:
                 raise _SessionResetRequired()
 
             try:
+                started = time.monotonic()
                 if cdn_redirect is not None:
                     cdn_client = await self._ensure_cdn_client(session, cdn_redirect)
                     request = functions.upload.GetCdnFileRequest(
@@ -677,6 +702,16 @@ class MediaMixin:
                             cdn_redirect.encryption_key,
                             cdn_redirect.encryption_iv,
                         )
+                    self._emit_media_transport_event(
+                        filename,
+                        "PART",
+                        offset=offset,
+                        size=len(data),
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        dc=cdn_redirect.dc_id,
+                        mode="cdn",
+                        sender=session.get("kind", "unknown"),
+                    )
                     return data
 
                 request = functions.upload.GetFileRequest(
@@ -688,10 +723,34 @@ class MediaMixin:
                 if isinstance(result, types.upload.FileCdnRedirect):
                     async with file_state["lock"]:
                         file_state["cdn_redirect"] = result
+                    self._emit_media_transport_event(
+                        filename,
+                        "CDN_REDIRECT",
+                        offset=offset,
+                        dc=result.dc_id,
+                    )
                     continue
+                self._emit_media_transport_event(
+                    filename,
+                    "PART",
+                    offset=offset,
+                    size=len(result.bytes),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    dc=dc_id,
+                    mode="direct",
+                    sender=session.get("kind", "unknown"),
+                )
                 return result.bytes
 
             except errors.TimedOutError:
+                self._emit_media_transport_event(
+                    filename,
+                    "TIMEOUT",
+                    offset=offset,
+                    limit=limit,
+                    dc=dc_id,
+                    retry=int(timed_out),
+                )
                 if timed_out:
                     raise
                 timed_out = True
@@ -700,6 +759,13 @@ class MediaMixin:
             except errors.FileMigrateError as exc:
                 async with file_state["lock"]:
                     file_state["dc_id"] = exc.new_dc
+                self._emit_media_transport_event(
+                    filename,
+                    "MIGRATE",
+                    offset=offset,
+                    from_dc=dc_id,
+                    to_dc=exc.new_dc,
+                )
                 raise _SessionResetRequired() from exc
 
             except (
@@ -707,6 +773,12 @@ class MediaMixin:
                 errors.FileReferenceExpiredError,
             ) as exc:
                 await self._refresh_document_file_reference(file_state, msg_data)
+                self._emit_media_transport_event(
+                    filename,
+                    "REFRESH",
+                    offset=offset,
+                    error=type(exc).__name__,
+                )
                 timed_out = False
                 continue
 
@@ -750,6 +822,22 @@ class MediaMixin:
         next_offset = 0
         part_size = _CHUNK_SIZE
         fh = open(temp_path, "r+b")
+        large = file_size >= _LARGE_FILE_THRESHOLD
+        effective_session_count = 1
+        effective_pipeline_depth = pipeline_depth
+        configured_inflight = max(1, session_count * pipeline_depth)
+        inflight_cap = (
+            _MAX_SINGLE_SENDER_INFLIGHT_LARGE
+            if large
+            else _MAX_SINGLE_SENDER_INFLIGHT_SMALL
+        )
+        effective_pipeline_depth = max(
+            pipeline_depth,
+            min(configured_inflight, inflight_cap),
+        )
+        transport_window_started = time.monotonic()
+        transport_window_bytes = 0
+        transport_window_parts = 0
 
         async def claim_offset() -> Optional[int]:
             nonlocal next_offset
@@ -761,12 +849,39 @@ class MediaMixin:
                 return result
 
         async def handle_part(offset: int, data: bytes) -> None:
-            nonlocal bytes_done
+            nonlocal bytes_done, transport_window_bytes, transport_window_parts
             async with write_lock:
                 fh.seek(offset)
                 fh.write(data)
                 bytes_done += len(data)
+                transport_window_bytes += len(data)
+                transport_window_parts += 1
                 self._emit_media_progress(filename, bytes_done, file_size)
+
+        def emit_transport_window(inflight: int, *, force: bool = False) -> None:
+            nonlocal transport_window_started, transport_window_bytes
+            nonlocal transport_window_parts
+            if not self._media_transport_logs_enabled():
+                return
+            now = time.monotonic()
+            elapsed = now - transport_window_started
+            if not force and elapsed < 1.0:
+                return
+            mbps = 0.0
+            if elapsed > 0:
+                mbps = (transport_window_bytes * 8) / elapsed / 1_000_000
+            self._emit_media_transport_event(
+                filename,
+                "WINDOW",
+                inflight=inflight,
+                mbps=f"{mbps:.2f}",
+                parts=transport_window_parts,
+                progress=bytes_done,
+                total=file_size,
+            )
+            transport_window_started = now
+            transport_window_bytes = 0
+            transport_window_parts = 0
 
         async def worker(session_index: int) -> None:
             session = await self._create_download_session(
@@ -775,12 +890,21 @@ class MediaMixin:
             )
             pending: Dict[asyncio.Task, int] = {}
             try:
+                self._emit_media_transport_event(
+                    filename,
+                    "PIPELINE",
+                    dc=file_info.dc_id,
+                    inflight=effective_pipeline_depth,
+                    large=int(large),
+                    requested_pipeline=pipeline_depth,
+                    requested_sessions=session_count,
+                    worker=session_index,
+                )
                 while not self._stop_requested:
                     await self._wait_for_media_resume(resume_event)
 
                     while (
-                        not self._stop_requested
-                        and len(pending) < pipeline_depth
+                        not self._stop_requested and len(pending) < effective_pipeline_depth
                     ):
                         offset = await claim_offset()
                         if offset is None:
@@ -792,6 +916,7 @@ class MediaMixin:
                                 offset,
                                 part_size,
                                 msg_data,
+                                filename,
                             )
                         )
                         pending[task] = offset
@@ -822,11 +947,13 @@ class MediaMixin:
                                     offset,
                                     part_size,
                                     msg_data,
+                                    filename,
                                 )
                             )
                             pending[retry_task] = offset
                             continue
                         await handle_part(offset, data)
+                    emit_transport_window(len(pending))
             finally:
                 for task in pending:
                     task.cancel()
@@ -837,7 +964,7 @@ class MediaMixin:
         try:
             workers = [
                 asyncio.create_task(worker(session_index))
-                for session_index in range(session_count)
+                for session_index in range(effective_session_count)
             ]
             await asyncio.gather(*workers)
         except Exception:
@@ -851,6 +978,7 @@ class MediaMixin:
         fh.close()
         if self._stop_requested or bytes_done < file_size:
             return None
+        emit_transport_window(0, force=True)
         self._emit_media_progress(filename, file_size, file_size, force=True)
         return self._finalize_media_download(temp_path, final_path, file_size)
 

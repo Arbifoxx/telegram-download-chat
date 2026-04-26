@@ -182,6 +182,9 @@ async def async_main() -> int:
         downloader.config.setdefault("settings", {})["media_progress_logs"] = bool(
             args.media_progress_logs
         )
+        downloader.config.setdefault("settings", {})["media_transport_logs"] = bool(
+            args.media_transport_logs
+        )
 
         downloads_dir = Path(
             downloader.config.get("settings", {}).get("save_path", get_downloads_dir())

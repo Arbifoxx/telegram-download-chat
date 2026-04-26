@@ -59,7 +59,9 @@ async def test_part_scheduler_downloads_all_parts_across_sessions(tmp_path):
     async def fake_close_download_session(session):
         return None
 
-    async def fake_request_file_part(session, file_state, offset, limit, msg_data):
+    async def fake_request_file_part(
+        session, file_state, offset, limit, msg_data, filename
+    ):
         seen_offsets.append((session["index"], offset, limit))
         await asyncio.sleep(0)
         return payload[offset : offset + limit]
@@ -91,11 +93,11 @@ async def test_part_scheduler_downloads_all_parts_across_sessions(tmp_path):
     assert result == dest
     assert dest.read_bytes() == payload
     assert not temp.exists()
-    assert created_sessions == [0, 1]
+    assert created_sessions == [0]
     assert {offset for _, offset, _ in seen_offsets} == set(
         range(0, len(payload), _CHUNK_SIZE)
     )
-    assert {session_index for session_index, _, _ in seen_offsets} == {0, 1}
+    assert {session_index for session_index, _, _ in seen_offsets} == {0}
 
 
 @pytest.mark.asyncio

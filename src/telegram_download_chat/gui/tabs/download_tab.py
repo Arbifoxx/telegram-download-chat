@@ -292,6 +292,11 @@ class DownloadTab(QWidget):
         )
         settings_form.addRow("Media progress logs:", self.media_progress_logs_chk)
 
+        self.media_transport_logs_chk = QCheckBox(
+            "Media transport timing diagnostics"
+        )
+        settings_form.addRow("Media transport logs:", self.media_transport_logs_chk)
+
         # HTML export
         self.html_chk = QCheckBox("Telegram-style interactive HTML")
         settings_form.addRow("HTML export:", self.html_chk)
@@ -706,6 +711,11 @@ class DownloadTab(QWidget):
                     bool(settings["media_progress_logs"])
                 )
 
+            if "media_transport_logs" in settings:
+                self.media_transport_logs_chk.setChecked(
+                    bool(settings["media_transport_logs"])
+                )
+
             if "html" in settings:
                 self.html_chk.setChecked(settings["html"])
 
@@ -765,6 +775,7 @@ class DownloadTab(QWidget):
                     "download_concurrency": self.concurrency_spin.value(),
                     "large_file_concurrency": self.large_file_concurrency_spin.value(),
                     "media_progress_logs": self.media_progress_logs_chk.isChecked(),
+                    "media_transport_logs": self.media_transport_logs_chk.isChecked(),
                     "html": self.html_chk.isChecked(),
                     "pdf": self.pdf_chk.isChecked(),
                     "sort": self.sort_combo.currentData() or "asc",
@@ -886,6 +897,8 @@ class DownloadTab(QWidget):
         )
         if self.media_progress_logs_chk.isChecked():
             cmd_args.append("--media-progress-logs")
+        if self.media_transport_logs_chk.isChecked():
+            cmd_args.append("--media-transport-logs")
 
         if self.html_chk.isChecked():
             if importlib.util.find_spec("jinja2") is None:
@@ -1120,6 +1133,9 @@ class DownloadTab(QWidget):
             self.large_file_concurrency_spin.setValue(int(large_file_concurrency))
         self.media_progress_logs_chk.setChecked(
             bool(settings.get("media_progress_logs", False))
+        )
+        self.media_transport_logs_chk.setChecked(
+            bool(settings.get("media_transport_logs", False))
         )
         self.html_chk.setChecked(bool(settings.get("html", False)))
         self.pdf_chk.setChecked(bool(settings.get("pdf", False)))
