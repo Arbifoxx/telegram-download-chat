@@ -482,6 +482,10 @@ class MediaMixin:
         force: bool = False,
     ) -> None:
         """Throttle progress log emission to avoid stdout/UI backpressure."""
+        settings = getattr(self, "config", {}).get("settings", {})
+        if not settings.get("media_progress_logs", False):
+            return
+
         if total_bytes <= 0:
             self.logger.info(
                 f"MEDIA_FILE_PROGRESS:{filename}:{int(bytes_done)}:{int(total_bytes)}"

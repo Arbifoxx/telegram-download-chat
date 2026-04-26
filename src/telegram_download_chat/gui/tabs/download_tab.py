@@ -286,6 +286,12 @@ class DownloadTab(QWidget):
         self.large_file_concurrency_spin.setMaximumWidth(200)
         settings_form.addRow("Large file downloads:", self.large_file_concurrency_spin)
 
+        # Per-file progress log spam toggle
+        self.media_progress_logs_chk = QCheckBox(
+            "Verbose per-file media progress markers"
+        )
+        settings_form.addRow("Media progress logs:", self.media_progress_logs_chk)
+
         # HTML export
         self.html_chk = QCheckBox("Telegram-style interactive HTML")
         settings_form.addRow("HTML export:", self.html_chk)
@@ -695,6 +701,11 @@ class DownloadTab(QWidget):
                     int(settings["large_file_concurrency"])
                 )
 
+            if "media_progress_logs" in settings:
+                self.media_progress_logs_chk.setChecked(
+                    bool(settings["media_progress_logs"])
+                )
+
             if "html" in settings:
                 self.html_chk.setChecked(settings["html"])
 
@@ -753,6 +764,7 @@ class DownloadTab(QWidget):
                     "media": self.media_chk.isChecked(),
                     "download_concurrency": self.concurrency_spin.value(),
                     "large_file_concurrency": self.large_file_concurrency_spin.value(),
+                    "media_progress_logs": self.media_progress_logs_chk.isChecked(),
                     "html": self.html_chk.isChecked(),
                     "pdf": self.pdf_chk.isChecked(),
                     "sort": self.sort_combo.currentData() or "asc",
@@ -872,6 +884,8 @@ class DownloadTab(QWidget):
                 str(self.large_file_concurrency_spin.value()),
             ]
         )
+        if self.media_progress_logs_chk.isChecked():
+            cmd_args.append("--media-progress-logs")
 
         if self.html_chk.isChecked():
             if importlib.util.find_spec("jinja2") is None:
@@ -1067,6 +1081,7 @@ class DownloadTab(QWidget):
         settings["media"] = self.media_chk.isChecked()
         settings["download_concurrency"] = self.concurrency_spin.value()
         settings["large_file_concurrency"] = self.large_file_concurrency_spin.value()
+        settings["media_progress_logs"] = self.media_progress_logs_chk.isChecked()
         settings["html"] = self.html_chk.isChecked()
         settings["pdf"] = self.pdf_chk.isChecked()
         settings["sort"] = self.sort_combo.currentData() or "asc"
@@ -1103,6 +1118,9 @@ class DownloadTab(QWidget):
         large_file_concurrency = settings.get("large_file_concurrency")
         if large_file_concurrency is not None:
             self.large_file_concurrency_spin.setValue(int(large_file_concurrency))
+        self.media_progress_logs_chk.setChecked(
+            bool(settings.get("media_progress_logs", False))
+        )
         self.html_chk.setChecked(bool(settings.get("html", False)))
         self.pdf_chk.setChecked(bool(settings.get("pdf", False)))
 

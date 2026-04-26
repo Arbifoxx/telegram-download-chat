@@ -41,6 +41,7 @@ class CLIOptions:
     pause_file: Optional[str] = None
     download_concurrency: Optional[int] = None
     large_file_concurrency: Optional[int] = None
+    media_progress_logs: bool = False
 
 
 def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
@@ -197,6 +198,12 @@ def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
         type=int,
         default=None,
         help="Number of very large media files to download concurrently (overrides config)",
+    )
+    parser.add_argument(
+        "--media-progress-logs",
+        dest="media_progress_logs",
+        action="store_true",
+        help="Emit per-file media progress markers to the log/stdout",
     )
 
     args = parser.parse_args(argv)
