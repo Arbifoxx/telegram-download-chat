@@ -99,6 +99,8 @@ settings:
   session_name: session     # Optional: Custom session file name
   request_delay: 1          # Delay between API requests in seconds
   max_retries: 5            # Maximum number of retry attempts
+  download_concurrency: 5   # Concurrent media files
+  large_file_concurrency: 2 # Concurrent large media files (>= 5 MB)
   log_level: INFO           # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
   log_file: app.log        # Path to log file (relative to app dir or absolute)
 
@@ -187,6 +189,12 @@ telegram-download-chat username --preset short
 
 # Resume download starting after a specific message ID
 telegram-download-chat username --since-id 5000
+```
+
+For best large-media performance, install `cryptg` if it is available for your platform:
+
+```bash
+pip install cryptg
 ```
 
 ### Command Line Options

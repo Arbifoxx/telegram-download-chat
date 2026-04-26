@@ -252,6 +252,22 @@ class MediaMixin:
         category = self._get_media_category(media)
         return f"{category}/{message_id}_{filename}"
 
+    def _get_media_file_size(self, media: Any) -> int:
+        """Return the media size in bytes when known, otherwise 0."""
+        if isinstance(media, MessageMediaDocument) and isinstance(media.document, Document):
+            return int(getattr(media.document, "size", 0) or 0)
+
+        if isinstance(media, MessageMediaWebPage):
+            webpage = media.webpage
+            if (
+                isinstance(webpage, WebPage)
+                and webpage.document
+                and isinstance(webpage.document, Document)
+            ):
+                return int(getattr(webpage.document, "size", 0) or 0)
+
+        return 0
+
     # ------------------------------------------------------------------
     # Download methods
     # ------------------------------------------------------------------
@@ -300,11 +316,7 @@ class MediaMixin:
         max_retries = settings.get("max_retries", 5)
         num_workers = settings.get("download_workers", 4)
 
-        file_size = (
-            media.document.size
-            if isinstance(media, MessageMediaDocument) and isinstance(media.document, Document)
-            else 0
-        )
+        file_size = self._get_media_file_size(media)
         use_parallel = file_size >= _PARALLEL_THRESHOLD
 
         unique_name = download_to.name  # "{message_id}_{filename}" — unique per message
@@ -454,8 +466,16 @@ class MediaMixin:
         settings = getattr(self, "config", {}).get("settings", {})
         CONCURRENCY = settings.get("download_concurrency", 5)
         ERROR_THRESHOLD = settings.get("media_error_threshold", 5)
+        LARGE_FILE_CONCURRENCY = max(
+            1,
+            min(
+                CONCURRENCY,
+                int(settings.get("large_file_concurrency", 2) or 2),
+            ),
+        )
 
         semaphore = asyncio.Semaphore(CONCURRENCY)
+        large_file_semaphore = asyncio.Semaphore(LARGE_FILE_CONCURRENCY)
         resume_event = asyncio.Event()
         resume_event.set()
 
@@ -476,9 +496,20 @@ class MediaMixin:
                 await self._wait_for_media_resume(resume_event)
                 if self._stop_requested:
                     return
-                path = await self.download_message_media(
-                    msg, attachments_dir, resume_event=resume_event
+                media = getattr(msg, "media", None) or (
+                    msg.get("media") if isinstance(msg, dict) else None
                 )
+                file_size = self._get_media_file_size(media) if media else 0
+
+                if file_size >= _PARALLEL_THRESHOLD:
+                    async with large_file_semaphore:
+                        path = await self.download_message_media(
+                            msg, attachments_dir, resume_event=resume_event
+                        )
+                else:
+                    path = await self.download_message_media(
+                        msg, attachments_dir, resume_event=resume_event
+                    )
                 msg_id = str(
                     getattr(msg, "id", None)
                     or (msg.get("id") if isinstance(msg, dict) else None)

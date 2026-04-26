@@ -137,3 +137,47 @@ async def test_manual_pause_blocks_queued_media_downloads(tmp_path):
         "1": "documents/1.bin",
         "2": "documents/2.bin",
     }
+
+
+@pytest.mark.asyncio
+async def test_large_file_concurrency_is_capped(tmp_path):
+    downloader = DummyDownloader()
+    downloader.config["settings"].update(
+        {
+            "download_concurrency": 5,
+            "large_file_concurrency": 2,
+            "media_error_threshold": 999,
+        }
+    )
+
+    active_large = 0
+    max_active_large = 0
+    release = asyncio.Event()
+
+    async def fake_download_message_media(msg, attachments_dir, resume_event=None):
+        nonlocal active_large, max_active_large
+        active_large += 1
+        max_active_large = max(max_active_large, active_large)
+        await release.wait()
+        active_large -= 1
+        return attachments_dir / "documents" / f"{msg['id']}.bin"
+
+    downloader.download_message_media = AsyncMock(side_effect=fake_download_message_media)
+    downloader._get_media_file_size = lambda media: _CHUNK_SIZE * 20
+
+    task = asyncio.create_task(
+        downloader.download_all_media(
+            messages=[
+                {"id": 1, "media": object()},
+                {"id": 2, "media": object()},
+                {"id": 3, "media": object()},
+            ],
+            attachments_dir=tmp_path,
+        )
+    )
+
+    await asyncio.sleep(0.2)
+    assert max_active_large == 2
+
+    release.set()
+    await asyncio.wait_for(task, timeout=1)
