@@ -16,6 +16,7 @@ class DownloadMixin:
         self.partial_manager = PartialDownloadManager(self.make_serializable, logger)
         self._stop_requested = False
         self._stop_file: Path | None = None
+        self._pause_file: Path | None = None
 
     async def download_chat(
         self,
@@ -222,6 +223,9 @@ class DownloadMixin:
                 self._stop_file.touch()
             except Exception:
                 pass
+
+    def set_pause_file(self, pause_file_path: str) -> None:
+        self._pause_file = Path(pause_file_path)
 
     def set_stop_file(self, stop_file_path: str) -> None:
         self._stop_file = Path(stop_file_path)

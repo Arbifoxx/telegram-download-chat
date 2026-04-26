@@ -38,6 +38,10 @@ class DownloadTab(QWidget):
     # Signal emitted when the user clicks Resume after a rate-limit pause
     download_resumed = Signal()
 
+    # Signal emitted when user manually pauses/resumes
+    download_paused = Signal()
+    download_unpaused = Signal()
+
     def __init__(self, parent=None):
         """Initialize the download tab.
 
@@ -410,6 +414,33 @@ class DownloadTab(QWidget):
         self.resume_btn.hide()
         btn_layout.addWidget(self.resume_btn)
 
+        # Pause/Resume button — for manual pause during downloads
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setFixedHeight(40)
+        self.pause_btn.setCursor(Qt.PointingHandCursor)
+        self.pause_btn.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                font-weight: bold;
+                padding: 8px 16px;
+                min-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #0D47A1;
+                padding: 9px 15px 7px 17px;
+            }
+        """
+        )
+        self.pause_btn.hide()
+        btn_layout.addWidget(self.pause_btn)
+
         # Add stretch to push buttons to the left
         btn_layout.addStretch()
 
@@ -462,20 +493,84 @@ class DownloadTab(QWidget):
 
         parent_layout.addWidget(self.progress)
 
+        # Currently-downloading filename label
+        self.file_label = QLabel("")
+        self.file_label.setVisible(False)
+        parent_layout.addWidget(self.file_label)
+
+        # Per-file progress bar
+        self.file_progress = QProgressBar()
+        self.file_progress.setTextVisible(True)
+        self.file_progress.setRange(0, 100)
+        self.file_progress.setValue(0)
+        self.file_progress.setFormat("0%")
+        self.file_progress.setVisible(False)
+        self.file_progress.setStyleSheet(
+            """
+            QProgressBar {
+                border: 1px solid #cccccc;
+                border-radius: 4px;
+                text-align: center;
+                background-color: #f5f5f5;
+                height: 18px;
+            }
+            QProgressBar::chunk {
+                background-color: #2196F3;
+                border-radius: 2px;
+            }
+        """
+        )
+        parent_layout.addWidget(self.file_progress)
+
     def _connect_signals(self):
         """Connect signals to slots."""
         self.settings_tree.clicked.connect(self.toggle_settings_visibility)
         self.start_btn.clicked.connect(self.start_download)
         self.stop_btn.clicked.connect(self.stop_download)
         self.resume_btn.clicked.connect(self._on_resume_clicked)
+        self.pause_btn.clicked.connect(self._on_pause_clicked)
         self.chat_edit.returnPressed.connect(self.start_download)
+        self._is_manually_paused = False
 
     def _on_resume_clicked(self):
         self.resume_btn.hide()
         self.download_resumed.emit()
 
+    def _on_pause_clicked(self):
+        if self._is_manually_paused:
+            self._is_manually_paused = False
+            self.pause_btn.setText("Pause")
+            self.download_unpaused.emit()
+        else:
+            self._is_manually_paused = True
+            self.pause_btn.setText("Resume")
+            self.download_paused.emit()
+
     def show_resume_button(self, visible: bool):
         self.resume_btn.setVisible(visible)
+
+    def update_file_info(self, filename: str, total_bytes: int):
+        """Display the name of the file currently being downloaded."""
+        if filename:
+            self.file_label.setText(f"Downloading: {filename}")
+            self.file_label.setVisible(True)
+            self.file_progress.setValue(0)
+            self.file_progress.setFormat("0%")
+            if total_bytes > 0:
+                self.file_progress.setMaximum(total_bytes)
+            self.file_progress.setVisible(total_bytes > 0)
+        else:
+            self.file_label.setVisible(False)
+            self.file_progress.setVisible(False)
+
+    def update_file_progress(self, bytes_done: int, total_bytes: int):
+        """Update the per-file download progress bar."""
+        if total_bytes > 0:
+            self.file_progress.setMaximum(total_bytes)
+            self.file_progress.setValue(bytes_done)
+            pct = int(bytes_done / total_bytes * 100)
+            self.file_progress.setFormat(f"{pct}%")
+            self.file_progress.setVisible(True)
 
     def _load_settings(self):
         """Load settings from config."""
@@ -771,13 +866,19 @@ class DownloadTab(QWidget):
         """
         self.start_btn.setEnabled(not in_progress)
         self.stop_btn.setEnabled(in_progress)
+        self.pause_btn.setVisible(in_progress)
 
         if in_progress:
+            self._is_manually_paused = False
+            self.pause_btn.setText("Pause")
             self.progress.setVisible(True)
             self.progress.setMaximum(0)  # Indeterminate mode
             self.progress.setFormat("Downloading...")
             self._start_loading_animation()
         else:
+            self.resume_btn.hide()
+            self.file_label.setVisible(False)
+            self.file_progress.setVisible(False)
             self.progress.setMaximum(100)
             self.progress.setValue(100)
             self.progress.setFormat("Completed")

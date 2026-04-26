@@ -38,6 +38,7 @@ class CLIOptions:
     export_html: bool = False
     export_pdf: bool = False
     media_placeholders: bool = False
+    pause_file: Optional[str] = None
 
 
 def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
@@ -173,6 +174,13 @@ def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
         "--media-placeholders",
         action="store_true",
         help="Insert media type indicators (e.g. [photo], [file=name.pdf]) in TXT output",
+    )
+    parser.add_argument(
+        "--pause-file",
+        dest="pause_file",
+        type=str,
+        default=None,
+        help="Path to a file whose presence signals a manual pause of media downloads",
     )
 
     args = parser.parse_args(argv)

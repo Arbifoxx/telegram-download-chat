@@ -172,6 +172,9 @@ async def async_main() -> int:
         else:
             downloader.set_stop_file(str(stop_file))
 
+        if args.pause_file:
+            downloader.set_pause_file(args.pause_file)
+
         downloads_dir = Path(
             downloader.config.get("settings", {}).get("save_path", get_downloads_dir())
         )

@@ -298,11 +298,14 @@ class MediaMixin:
         max_retries = settings.get("max_retries", 5)
         num_workers = settings.get("download_workers", 4)
 
-        use_parallel = (
-            isinstance(media, MessageMediaDocument)
-            and isinstance(media.document, Document)
-            and media.document.size >= _PARALLEL_THRESHOLD
+        file_size = (
+            media.document.size
+            if isinstance(media, MessageMediaDocument) and isinstance(media.document, Document)
+            else 0
         )
+        use_parallel = file_size >= _PARALLEL_THRESHOLD
+
+        self.logger.info(f"MEDIA_DOWNLOADING:{filename}:{file_size}")
 
         for attempt in range(max_retries + 1):
             try:
@@ -312,9 +315,10 @@ class MediaMixin:
                 if use_parallel:
                     result = await self._download_parallel(
                         message,
-                        media.document.size,
+                        file_size,
                         download_to,
                         num_workers,
+                        filename,
                     )
                 else:
                     result = await self.client.download_media(
@@ -423,6 +427,15 @@ class MediaMixin:
             await resume_event.wait()
             if self._stop_requested:
                 return
+            # Manual pause: poll until the pause file disappears
+            if self._pause_file and self._pause_file.exists():
+                self.logger.info("MEDIA_MANUALLY_PAUSED")
+                while self._pause_file and self._pause_file.exists() and not self._stop_requested:
+                    await asyncio.sleep(0.5)
+                if not self._stop_requested:
+                    self.logger.info("MEDIA_RESUMED")
+            if self._stop_requested:
+                return
             async with semaphore:
                 if self._stop_requested:
                     return
@@ -473,6 +486,7 @@ class MediaMixin:
         file_size: int,
         dest_path: Path,
         num_workers: int,
+        filename: str = "",
     ) -> Optional[Path]:
         """Download a file with a sliding window of concurrent chunk requests.
 
@@ -490,8 +504,10 @@ class MediaMixin:
             f.write(b"\x00")
 
         fh = open(dest_path, "r+b")
+        bytes_done = 0
+        last_pct = -1
 
-        async def fetch_and_write(idx: int) -> None:
+        async def fetch_and_write(idx: int) -> int:
             offset = idx * _CHUNK_SIZE
             async for chunk in self.client.iter_download(
                 message,
@@ -500,7 +516,8 @@ class MediaMixin:
             ):
                 fh.seek(offset)
                 fh.write(chunk)
-                return
+                return len(chunk)
+            return 0
 
         try:
             pending: set = set()
@@ -518,6 +535,15 @@ class MediaMixin:
                     exc = task.exception()
                     if exc:
                         raise exc
+                    written = task.result() or 0
+                    bytes_done += written
+                    if file_size > 0:
+                        pct = int(bytes_done / file_size * 100)
+                        if pct != last_pct:
+                            last_pct = pct
+                            self.logger.info(
+                                f"MEDIA_FILE_PROGRESS:{filename}:{bytes_done}:{file_size}"
+                            )
                     if next_idx < num_chunks:
                         pending.add(asyncio.create_task(fetch_and_write(next_idx)))
                         next_idx += 1

@@ -20,6 +20,9 @@ class WorkerThread(QThread):
     finished = Signal(list, bool)  # files, was_stopped_by_user
     media_paused = Signal()
     media_resumed = Signal()
+    media_manually_paused = Signal()
+    file_downloading = Signal(str, int)  # filename, total_bytes
+    file_progress = Signal(int, int)  # bytes_done, total_bytes
 
     def __init__(self, cmd_args, output_dir):
         """Initialize the worker thread.
@@ -37,15 +40,31 @@ class WorkerThread(QThread):
         self.process = None
         self._stop_file = None  # Path to stop file for inter-process communication
         self._pause_file: Path | None = None
+        self._manual_pause_file: Path | None = None  # User-triggered pause
+
+    def pause(self):
+        """Manually pause media downloads."""
+        if self._manual_pause_file:
+            try:
+                self._manual_pause_file.touch()
+            except Exception:
+                pass
 
     def resume(self):
-        """Resume media downloads after a rate-limit pause."""
+        """Resume media downloads (rate-limit or manual pause)."""
+        # Rate-limit pause file
         if self._pause_file and self._pause_file.exists():
             try:
                 self._pause_file.unlink()
             except Exception:
                 pass
         self._pause_file = None
+        # Manual pause file
+        if self._manual_pause_file and self._manual_pause_file.exists():
+            try:
+                self._manual_pause_file.unlink()
+            except Exception:
+                pass
 
     def stop(self):
         """Stop the worker thread gracefully."""
@@ -104,10 +123,44 @@ class WorkerThread(QThread):
                     self._pause_file = Path(pause_path)
             self.status_update.emit("Media downloads paused (rate limited)")
             self.media_paused.emit()
+        elif "media_manually_paused" in lower:
+            self.status_update.emit("Media downloads paused")
+            self.media_manually_paused.emit()
         elif "media_resumed" in lower:
             self._pause_file = None
             self.status_update.emit("Media downloads resumed")
             self.media_resumed.emit()
+        elif "media_downloading:" in lower:
+            marker = "MEDIA_DOWNLOADING:"
+            idx = line.upper().find(marker)
+            if idx != -1:
+                raw = line[idx + len(marker):]
+                # Format: {filename}:{file_size} — split from right so filenames with colons work
+                fname, _, size_str = raw.rpartition(":")
+                if not fname:
+                    fname = size_str
+                    size_str = "0"
+                try:
+                    total = int(size_str)
+                except ValueError:
+                    total = 0
+                if fname:
+                    self.file_downloading.emit(fname, total)
+                    self.file_progress.emit(0, total)
+        elif "media_file_progress:" in lower:
+            marker = "MEDIA_FILE_PROGRESS:"
+            idx = line.upper().find(marker)
+            if idx != -1:
+                raw = line[idx + len(marker):]
+                # Format: {filename}:{bytes_done}:{total} — last two segments are numbers
+                try:
+                    right = raw.rsplit(":", 2)
+                    if len(right) >= 3:
+                        done = int(right[-2])
+                        total = int(right[-1])
+                        self.file_progress.emit(done, total)
+                except (ValueError, IndexError):
+                    pass
 
     def _extract_progress(self, line):
         """Extract progress information from command output.
@@ -155,9 +208,17 @@ class WorkerThread(QThread):
         """Run the worker thread."""
         files = []
 
+        import tempfile as _tempfile
+        self._manual_pause_file = (
+            Path(_tempfile.gettempdir()) / f"tdc_manual_pause_{os.getpid()}.tmp"
+        )
+        # Ensure it doesn't exist at start
+        self._manual_pause_file.unlink(missing_ok=True)
+
         try:
             # Build the command using the module path directly
             cmd = [sys.executable, "-m", "telegram_download_chat"] + self.cmd
+            cmd += ["--pause-file", str(self._manual_pause_file)]
 
             self.log.emit(f"Executing: {' '.join(cmd)}")
 
@@ -248,6 +309,13 @@ class WorkerThread(QThread):
             if self._stop_file and self._stop_file.exists():
                 try:
                     self._stop_file.unlink()
+                except Exception:
+                    pass
+
+            # Clean up manual pause file
+            if self._manual_pause_file and self._manual_pause_file.exists():
+                try:
+                    self._manual_pause_file.unlink()
                 except Exception:
                     pass
 
