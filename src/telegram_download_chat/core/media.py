@@ -43,7 +43,6 @@ _CAT_OTHER = "other"
 
 _PARALLEL_THRESHOLD = 5 * 1024 * 1024  # parallelize files >= 5 MB
 _CHUNK_SIZE = 512 * 1024               # 512 KB per request (Telegram's standard block)
-_WORKER_STAGGER_S = 0.08               # seconds between worker starts to desynchronize RTT cycles
 
 _ARCHIVE_MIMES = {
     "application/zip",
@@ -475,46 +474,59 @@ class MediaMixin:
         dest_path: Path,
         num_workers: int,
     ) -> Optional[Path]:
-        """Download a file using strided workers with staggered starts.
+        """Download a file with a sliding window of concurrent chunk requests.
 
-        Each worker i owns every num_workers-th chunk starting at chunk i,
-        keeping one long-lived iter_download connection open for the entire
-        file. Workers start _WORKER_STAGGER_S apart so their request/response
-        cycles stay out of phase — preventing the bandwidth sawtooth that
-        occurs when all workers pause to await responses simultaneously.
+        Keeps exactly num_workers chunk requests in flight at all times. As
+        soon as any request completes the next chunk fires immediately, so
+        completions are always staggered in real time. This is robust against
+        individual connection resets (e.g. exported DC auth expiry after ~5
+        min): the other in-flight requests keep the pipe full while one slot
+        reconnects, so no synchronised stall can form.
         """
-        stride = _CHUNK_SIZE * num_workers
+        num_chunks = (file_size + _CHUNK_SIZE - 1) // _CHUNK_SIZE
 
         with open(dest_path, "wb") as f:
             f.seek(file_size - 1)
             f.write(b"\x00")
 
-        async def worker(worker_id: int) -> None:
-            if worker_id > 0:
-                await asyncio.sleep(worker_id * _WORKER_STAGGER_S)
-            start_offset = worker_id * _CHUNK_SIZE
-            current_offset = start_offset
-            with open(dest_path, "r+b") as f:
-                async for chunk in self.client.iter_download(
-                    message,
-                    offset=start_offset,
-                    stride=stride,
-                    request_size=_CHUNK_SIZE,
-                ):
-                    f.seek(current_offset)
-                    f.write(chunk)
-                    current_offset += stride
+        fh = open(dest_path, "r+b")
 
-        active = [
-            worker(i)
-            for i in range(num_workers)
-            if i * _CHUNK_SIZE < file_size
-        ]
+        async def fetch_and_write(idx: int) -> None:
+            offset = idx * _CHUNK_SIZE
+            async for chunk in self.client.iter_download(
+                message,
+                offset=offset,
+                request_size=_CHUNK_SIZE,
+            ):
+                fh.seek(offset)
+                fh.write(chunk)
+                return
+
         try:
-            await asyncio.gather(*active)
+            pending: set = set()
+            next_idx = 0
+
+            while next_idx < min(num_workers, num_chunks):
+                pending.add(asyncio.create_task(fetch_and_write(next_idx)))
+                next_idx += 1
+
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    exc = task.exception()
+                    if exc:
+                        raise exc
+                    if next_idx < num_chunks:
+                        pending.add(asyncio.create_task(fetch_and_write(next_idx)))
+                        next_idx += 1
         except Exception:
+            fh.close()
             dest_path.unlink(missing_ok=True)
             raise
+
+        fh.close()
         return dest_path
 
     def _get_media_category(self, media: Any) -> str:

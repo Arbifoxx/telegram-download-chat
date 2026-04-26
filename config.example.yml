@@ -24,11 +24,12 @@ settings:
   # Telegram Premium users can typically sustain higher values.
   download_concurrency: 5
 
-  # Number of parallel chunk workers per file for large downloads (>= 5 MB).
-  # Each worker opens a separate connection to the file's DC and downloads a
-  # different stripe of the file simultaneously, multiplying effective speed.
-  # 4 workers typically saturates a premium account's allowed bandwidth.
-  download_workers: 4
+  # Number of concurrent chunk requests kept in flight per large file (>= 5 MB).
+  # A sliding window fires the next chunk request the moment any slot completes,
+  # so individual connection resets (DC auth expiry, ~5 min) only idle one slot
+  # while the rest keep the bandwidth up. 16 is a good default; raise it if you
+  # have headroom and still see dips, lower it if you hit rate limits.
+  download_workers: 16
   
   # Log file path (empty for console only)
   log_file: ./data/telegram_downloader.log
