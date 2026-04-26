@@ -327,6 +327,7 @@ class MediaMixin:
                     result = Path(result) if result else None
 
                 if result:
+                    self.logger.info(f"MEDIA_DOWNLOADED:{filename}")
                     self.logger.debug(
                         f"Downloaded media for message {message_id}: {result}"
                     )

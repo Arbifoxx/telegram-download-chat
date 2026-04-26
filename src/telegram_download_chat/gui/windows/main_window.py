@@ -337,6 +337,9 @@ class MainWindow(QMainWindow):
             self.worker_thread.file_progress.connect(
                 self.download_tab.update_file_progress
             )
+            self.worker_thread.file_done.connect(
+                self.download_tab.mark_file_done
+            )
 
             # Update UI
             self.status_bar.showMessage("Downloading...")

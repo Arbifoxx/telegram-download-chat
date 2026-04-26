@@ -500,34 +500,13 @@ class DownloadTab(QWidget):
 
         parent_layout.addWidget(self.progress)
 
-        # Currently-downloading filename label
-        self.file_label = QLabel("")
-        self.file_label.setVisible(False)
-        parent_layout.addWidget(self.file_label)
-
-        # Per-file progress bar
-        self.file_progress = QProgressBar()
-        self.file_progress.setTextVisible(True)
-        self.file_progress.setRange(0, 100)
-        self.file_progress.setValue(0)
-        self.file_progress.setFormat("0%")
-        self.file_progress.setVisible(False)
-        self.file_progress.setStyleSheet(
-            """
-            QProgressBar {
-                border: 1px solid #cccccc;
-                border-radius: 4px;
-                text-align: center;
-                background-color: #f5f5f5;
-                height: 18px;
-            }
-            QProgressBar::chunk {
-                background-color: #2196F3;
-                border-radius: 2px;
-            }
-        """
-        )
-        parent_layout.addWidget(self.file_progress)
+        # Per-file download panel (populated dynamically during downloads)
+        self._file_panel = QWidget()
+        self._file_panel.setVisible(False)
+        self._file_panel_layout = QVBoxLayout(self._file_panel)
+        self._file_panel_layout.setContentsMargins(0, 2, 0, 0)
+        self._file_panel_layout.setSpacing(3)
+        parent_layout.addWidget(self._file_panel)
 
     def _connect_signals(self):
         """Connect signals to slots."""
@@ -538,7 +517,7 @@ class DownloadTab(QWidget):
         self.pause_btn.clicked.connect(self._on_pause_clicked)
         self.chat_edit.returnPressed.connect(self.start_download)
         self._is_manually_paused = False
-        self._current_download_file = None
+        self._file_rows = {}  # fname -> (row_widget, label, bar)
 
     def _on_resume_clicked(self):
         self.resume_btn.hide()
@@ -558,31 +537,75 @@ class DownloadTab(QWidget):
         self.resume_btn.setVisible(visible)
 
     def update_file_info(self, filename: str, total_bytes: int):
-        """Display the name of the file currently being downloaded."""
-        if filename:
-            self._current_download_file = filename
-            self.file_label.setText(f"Downloading: {filename}")
-            self.file_label.setVisible(True)
-            self.file_progress.setValue(0)
-            self.file_progress.setFormat("0%")
-            if total_bytes > 0:
-                self.file_progress.setMaximum(total_bytes)
-            self.file_progress.setVisible(total_bytes > 0)
+        """Add a progress row for a file that has started downloading."""
+        if not filename or filename in self._file_rows:
+            return
+        row = QWidget()
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(1)
+
+        label = QLabel(f"Downloading: {filename}")
+        row_layout.addWidget(label)
+
+        bar = QProgressBar()
+        bar.setTextVisible(True)
+        bar.setFixedHeight(16)
+        if total_bytes > 0:
+            bar.setRange(0, total_bytes)
+            bar.setValue(0)
+            bar.setFormat("0%")
         else:
-            self._current_download_file = None
-            self.file_label.setVisible(False)
-            self.file_progress.setVisible(False)
+            bar.setRange(0, 0)  # indeterminate
+            bar.setFormat("")
+        bar.setStyleSheet(
+            "QProgressBar { border: 1px solid #cccccc; border-radius: 3px;"
+            " text-align: center; background-color: #f5f5f5; }"
+            "QProgressBar::chunk { background-color: #2196F3; border-radius: 2px; }"
+        )
+        row_layout.addWidget(bar)
+
+        self._file_panel_layout.addWidget(row)
+        self._file_rows[filename] = (row, label, bar)
+        self._file_panel.setVisible(True)
 
     def update_file_progress(self, filename: str, bytes_done: int, total_bytes: int):
-        """Update the per-file download progress bar, ignoring other concurrent files."""
-        if filename != getattr(self, "_current_download_file", None):
+        """Update a file's progress bar."""
+        entry = self._file_rows.get(filename)
+        if not entry or total_bytes <= 0:
             return
-        if total_bytes > 0:
-            self.file_progress.setMaximum(total_bytes)
-            self.file_progress.setValue(bytes_done)
-            pct = int(bytes_done / total_bytes * 100)
-            self.file_progress.setFormat(f"{pct}%")
-            self.file_progress.setVisible(True)
+        _, _, bar = entry
+        bar.setRange(0, total_bytes)
+        bar.setValue(bytes_done)
+        pct = int(bytes_done / total_bytes * 100)
+        bar.setFormat(f"{pct}%")
+
+    def mark_file_done(self, filename: str):
+        """Mark a file's row as complete and remove it after a short delay."""
+        entry = self._file_rows.get(filename)
+        if not entry:
+            return
+        _, label, bar = entry
+        label.setText(f"Done: {filename}")
+        bar.setRange(0, 1)
+        bar.setValue(1)
+        bar.setFormat("100%")
+        QTimer.singleShot(3000, lambda: self._remove_file_row(filename))
+
+    def _remove_file_row(self, filename: str):
+        entry = self._file_rows.pop(filename, None)
+        if not entry:
+            return
+        row, _, _ = entry
+        self._file_panel_layout.removeWidget(row)
+        row.deleteLater()
+        if not self._file_rows:
+            self._file_panel.setVisible(False)
+
+    def _clear_file_panel(self):
+        for filename in list(self._file_rows):
+            self._remove_file_row(filename)
+        self._file_panel.setVisible(False)
 
     def _load_settings(self):
         """Load settings from config."""
@@ -895,9 +918,7 @@ class DownloadTab(QWidget):
             self._start_loading_animation()
         else:
             self.resume_btn.hide()
-            self._current_download_file = None
-            self.file_label.setVisible(False)
-            self.file_progress.setVisible(False)
+            self._clear_file_panel()
             self.progress.setMaximum(100)
             self.progress.setValue(100)
             self.progress.setFormat("Completed")
