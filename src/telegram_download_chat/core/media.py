@@ -43,6 +43,7 @@ _CAT_OTHER = "other"
 
 _PARALLEL_THRESHOLD = 5 * 1024 * 1024  # parallelize files >= 5 MB
 _CHUNK_SIZE = 512 * 1024               # 512 KB per request (Telegram's standard block)
+_WORKER_STAGGER_S = 0.08               # seconds between worker starts to desynchronize RTT cycles
 
 _ARCHIVE_MIMES = {
     "application/zip",
@@ -474,47 +475,43 @@ class MediaMixin:
         dest_path: Path,
         num_workers: int,
     ) -> Optional[Path]:
-        """Download a file using a work queue of fixed-size chunks.
+        """Download a file using strided workers with staggered starts.
 
-        Workers independently pull chunk indices from a shared queue and write
-        directly to their position in a pre-allocated file. Because workers
-        never synchronize with each other, a momentary stall in one worker
-        does not idle the others, producing steady aggregate throughput instead
-        of the burst-then-pause pattern caused by stride-based approaches.
+        Each worker i owns every num_workers-th chunk starting at chunk i,
+        keeping one long-lived iter_download connection open for the entire
+        file. Workers start _WORKER_STAGGER_S apart so their request/response
+        cycles stay out of phase — preventing the bandwidth sawtooth that
+        occurs when all workers pause to await responses simultaneously.
         """
-        num_chunks = (file_size + _CHUNK_SIZE - 1) // _CHUNK_SIZE
-
-        queue: asyncio.Queue[int] = asyncio.Queue()
-        for i in range(num_chunks):
-            queue.put_nowait(i)
+        stride = _CHUNK_SIZE * num_workers
 
         with open(dest_path, "wb") as f:
             f.seek(file_size - 1)
             f.write(b"\x00")
 
-        async def fetch_chunk(offset: int) -> bytes:
-            async for chunk in self.client.iter_download(
-                message,
-                offset=offset,
-                request_size=_CHUNK_SIZE,
-            ):
-                return chunk
-            return b""
-
-        async def worker() -> None:
-            while True:
-                try:
-                    idx = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                offset = idx * _CHUNK_SIZE
-                chunk = await fetch_chunk(offset)
-                with open(dest_path, "r+b") as f:
-                    f.seek(offset)
+        async def worker(worker_id: int) -> None:
+            if worker_id > 0:
+                await asyncio.sleep(worker_id * _WORKER_STAGGER_S)
+            start_offset = worker_id * _CHUNK_SIZE
+            current_offset = start_offset
+            with open(dest_path, "r+b") as f:
+                async for chunk in self.client.iter_download(
+                    message,
+                    offset=start_offset,
+                    stride=stride,
+                    request_size=_CHUNK_SIZE,
+                ):
+                    f.seek(current_offset)
                     f.write(chunk)
+                    current_offset += stride
 
+        active = [
+            worker(i)
+            for i in range(num_workers)
+            if i * _CHUNK_SIZE < file_size
+        ]
         try:
-            await asyncio.gather(*[worker() for _ in range(num_workers)])
+            await asyncio.gather(*active)
         except Exception:
             dest_path.unlink(missing_ok=True)
             raise
