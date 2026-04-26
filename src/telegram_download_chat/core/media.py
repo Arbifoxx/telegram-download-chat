@@ -51,6 +51,7 @@ _DEFAULT_FILE_SESSIONS = 4
 _DEFAULT_PIPELINE_DEPTH = 4
 _MAX_SINGLE_SENDER_INFLIGHT_SMALL = 8
 _MAX_SINGLE_SENDER_INFLIGHT_LARGE = 16
+_MAX_BORROWED_SENDER_INFLIGHT = 8
 
 _ARCHIVE_MIMES = {
     "application/zip",
@@ -829,17 +830,19 @@ class MediaMixin:
         fh = open(temp_path, "r+b")
         large = file_size >= _LARGE_FILE_THRESHOLD
         effective_session_count = 1
-        effective_pipeline_depth = pipeline_depth
         configured_inflight = max(1, session_count * pipeline_depth)
+        current_dc = int(getattr(self.client.session, "dc_id", 0) or 0)
+        remote_dc = file_info.dc_id != current_dc
         inflight_cap = (
-            _MAX_SINGLE_SENDER_INFLIGHT_LARGE
-            if large
-            else _MAX_SINGLE_SENDER_INFLIGHT_SMALL
+            _MAX_BORROWED_SENDER_INFLIGHT
+            if remote_dc
+            else (
+                _MAX_SINGLE_SENDER_INFLIGHT_LARGE
+                if large
+                else _MAX_SINGLE_SENDER_INFLIGHT_SMALL
+            )
         )
-        effective_pipeline_depth = max(
-            pipeline_depth,
-            min(configured_inflight, inflight_cap),
-        )
+        effective_pipeline_depth = max(1, min(configured_inflight, inflight_cap))
         transport_window_started = time.monotonic()
         transport_window_bytes = 0
         transport_window_parts = 0
@@ -923,6 +926,7 @@ class MediaMixin:
                     dc=file_info.dc_id,
                     inflight=effective_pipeline_depth,
                     large=int(large),
+                    remote=int(remote_dc),
                     requested_pipeline=pipeline_depth,
                     requested_sessions=session_count,
                     worker=session_index,
