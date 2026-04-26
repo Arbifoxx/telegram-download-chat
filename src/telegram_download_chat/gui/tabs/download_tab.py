@@ -605,7 +605,7 @@ class DownloadTab(QWidget):
         entry = self._file_rows.get(filename)
         if not entry:
             return
-        _, label, bar = entry
+        _, label, bar, _ = entry
         label.setText(f"Done: {filename}")
         bar.setRange(0, 1)
         bar.setValue(1)
@@ -616,7 +616,7 @@ class DownloadTab(QWidget):
         entry = self._file_rows.pop(filename, None)
         if not entry:
             return
-        row, _, _ = entry
+        row, _, _, _ = entry
         self._file_panel_layout.removeWidget(row)
         row.deleteLater()
         if not self._file_rows:
