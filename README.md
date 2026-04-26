@@ -100,7 +100,7 @@ settings:
   request_delay: 1          # Delay between API requests in seconds
   max_retries: 5            # Maximum number of retry attempts
   download_concurrency: 5   # Concurrent media files
-  large_file_concurrency: 2 # Concurrent very large media files (>= 512 MB)
+  large_file_concurrency: 2 # Concurrent large media files (>= 100 MB)
   log_level: INFO           # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
   log_file: app.log        # Path to log file (relative to app dir or absolute)
 

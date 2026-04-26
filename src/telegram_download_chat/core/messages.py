@@ -360,6 +360,7 @@ class MessagesMixin:
         export_pdf: bool = False,
         chat_title: Optional[str] = None,
         media_placeholders: bool = False,
+        overwrite_existing_files: bool = False,
     ) -> None:
         output_path = Path(output_file)
 
@@ -421,7 +422,11 @@ class MessagesMixin:
         # Download media attachments if requested
         if download_media:
             self.logger.info("Downloading media attachments...")
-            download_results = await self.download_all_media(messages, attachments_dir)
+            download_results = await self.download_all_media(
+                messages,
+                attachments_dir,
+                overwrite_existing_files=overwrite_existing_files,
+            )
             # Reconcile predicted paths with actual download results:
             # - null out attachment_path for messages whose downloads failed
             # - update attachment_path when Telethon used a different filename

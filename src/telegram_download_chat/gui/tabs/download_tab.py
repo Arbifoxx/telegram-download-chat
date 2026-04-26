@@ -580,7 +580,7 @@ class DownloadTab(QWidget):
             bar.setFormat("")
         bar.setStyleSheet(
             "QProgressBar { border: 1px solid #cccccc; border-radius: 3px;"
-            " text-align: center; background-color: #f5f5f5; }"
+            " text-align: center; background-color: #f5f5f5; color: #202124; }"
             "QProgressBar::chunk { background-color: #2196F3; border-radius: 2px; }"
         )
         row_layout.addWidget(bar)

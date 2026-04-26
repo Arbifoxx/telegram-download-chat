@@ -32,3 +32,4 @@ class TelegramChatDownloader(
         self._stop_file = None
         self._pause_file = None
         self._manual_pause_logged = False
+        self._media_progress_state = {}

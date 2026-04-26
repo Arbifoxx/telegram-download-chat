@@ -14,7 +14,12 @@ except ModuleNotFoundError:  # pragma: no cover - local fallback for ad-hoc exec
 
     pytest = _PytestFallback()
 
-from telegram_download_chat.core.media import MediaMixin, _CHUNK_SIZE
+from telegram_download_chat.core import media as media_module
+from telegram_download_chat.core.media import (
+    MediaMixin,
+    _CHUNK_SIZE,
+    _LARGE_FILE_THRESHOLD,
+)
 from telegram_download_chat.core.render import _attachment_meta_from_message
 
 
@@ -29,63 +34,95 @@ class DummyDownloader(MediaMixin):
         self._manual_pause_logged = False
 
 
-class FakeClient:
-    def __init__(self, payload: bytes):
-        self.payload = payload
-        self.calls = []
-
-    async def _iter_download(
-        self,
-        message,
-        *,
-        offset=0,
-        chunk_size=None,
-        request_size=None,
-        file_size=None,
-        msg_data=None,
-    ):
-        self.calls.append(
-            {
-                "offset": offset,
-                "chunk_size": chunk_size,
-                "request_size": request_size,
-                "file_size": file_size,
-                "msg_data": msg_data,
-            }
-        )
-        chunk_len = chunk_size or request_size or _CHUNK_SIZE
-        pos = offset
-
-        while pos < len(self.payload):
-            yield self.payload[pos : pos + chunk_len]
-            pos += chunk_len
-
-
 @pytest.mark.asyncio
-async def test_large_media_download_resumes_from_partial_file(tmp_path):
+async def test_large_media_download_uses_parallel_direct_stripes(tmp_path):
     downloader = DummyDownloader()
     payload = bytes(range(256)) * ((_CHUNK_SIZE * 4) // 256)
-    downloader.client = FakeClient(payload)
+    downloader.client = object()
+    downloader.config["settings"]["large_file_workers"] = 2
 
-    dest = tmp_path / "file.bin"
-    temp = downloader._get_partial_media_path(dest)
-    temp.write_bytes(payload[:_CHUNK_SIZE])
-    resume_event = asyncio.Event()
-    resume_event.set()
+    calls = []
 
-    result = await downloader._download_large_media(
-        message=object(),
-        file_size=len(payload),
-        temp_path=temp,
-        dest_path=dest,
-        filename="file.bin",
-        resume_event=resume_event,
-    )
+    class FakeDirectDownloadIter:
+        def __init__(
+            self,
+            client,
+            limit,
+            *,
+            file,
+            dc_id,
+            offset,
+            stride,
+            chunk_size,
+            request_size,
+            file_size,
+            msg_data,
+        ):
+            calls.append(
+                {
+                    "offset": offset,
+                    "stride": stride,
+                    "limit": limit,
+                    "chunk_size": chunk_size,
+                    "request_size": request_size,
+                    "file_size": file_size,
+                }
+            )
+            self.offset = offset
+            self.stride = stride
+            self.limit = limit
+            self.chunk_size = chunk_size
+            self.payload = payload
+
+        def __aiter__(self):
+            async def iterator():
+                pos = self.offset
+                emitted = 0
+                while pos < len(self.payload) and emitted < self.limit:
+                    yield self.payload[pos : pos + self.chunk_size]
+                    pos += self.stride
+                    emitted += 1
+
+            return iterator()
+
+        async def close(self):
+            return None
+
+    class FakeFileInfo:
+        def __init__(self, size):
+            self.location = object()
+            self.dc_id = 4
+            self.size = size
+
+    original_direct_iter = media_module._DirectDownloadIter
+    original_get_file_info = media_module.utils._get_file_info
+    media_module._DirectDownloadIter = FakeDirectDownloadIter
+    media_module.utils._get_file_info = lambda _: FakeFileInfo(len(payload))
+
+    try:
+        dest = tmp_path / "file.bin"
+        temp = downloader._get_partial_media_path(dest)
+        resume_event = asyncio.Event()
+        resume_event.set()
+
+        result = await downloader._download_large_media(
+            message=object(),
+            file_size=len(payload),
+            temp_path=temp,
+            dest_path=dest,
+            filename="file.bin",
+            resume_event=resume_event,
+        )
+    finally:
+        media_module._DirectDownloadIter = original_direct_iter
+        media_module.utils._get_file_info = original_get_file_info
 
     assert result == dest
     assert dest.read_bytes() == payload
     assert not temp.exists()
-    assert downloader.client.calls[0]["offset"] == _CHUNK_SIZE
+    assert len(calls) == 2
+    assert {call["offset"] for call in calls} == {0, _CHUNK_SIZE}
+    assert all(call["stride"] == _CHUNK_SIZE * 2 for call in calls)
 
 
 @pytest.mark.asyncio
@@ -202,6 +239,86 @@ async def test_existing_wrong_size_file_is_re_downloaded(tmp_path):
 
     assert result == final_path
     downloader._download_small_media.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partial_media_is_restarted_when_not_overwriting(tmp_path):
+    downloader = DummyDownloader()
+    downloader.config["settings"]["max_retries"] = 0
+
+    media = object()
+    final_path = tmp_path / "documents" / "1_file.bin"
+    part_path = downloader._get_partial_media_path(final_path)
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path.write_bytes(b"partial")
+
+    downloader.get_filename = lambda _: "file.bin"
+    downloader._get_media_category = lambda _: "documents"
+    downloader._get_media_file_size = lambda _: 10
+    downloader._serialize_synthetic_media = lambda *_: False
+    downloader._download_small_media = AsyncMock(return_value=final_path)
+
+    result = await downloader.download_message_media(
+        {"id": 1, "media": media},
+        tmp_path,
+        overwrite_existing_files=False,
+    )
+
+    assert result == final_path
+    assert not part_path.exists()
+    downloader._download_small_media.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_complete_media_is_re_downloaded_when_overwriting(tmp_path):
+    downloader = DummyDownloader()
+    downloader.config["settings"]["max_retries"] = 0
+
+    media = object()
+    final_path = tmp_path / "documents" / "1_file.bin"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_bytes(b"0123456789")
+
+    downloader.get_filename = lambda _: "file.bin"
+    downloader._get_media_category = lambda _: "documents"
+    downloader._get_media_file_size = lambda _: 10
+    downloader._serialize_synthetic_media = lambda *_: False
+    downloader._download_small_media = AsyncMock(return_value=final_path)
+
+    result = await downloader.download_message_media(
+        {"id": 1, "media": media},
+        tmp_path,
+        overwrite_existing_files=True,
+    )
+
+    assert result == final_path
+    downloader._download_small_media.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_files_over_threshold_use_striped_large_downloads(tmp_path):
+    downloader = DummyDownloader()
+    downloader.config["settings"]["max_retries"] = 0
+
+    media = object()
+    final_path = tmp_path / "archives" / "1_big.bin"
+
+    downloader.get_filename = lambda _: "big.bin"
+    downloader._get_media_category = lambda _: "archives"
+    downloader._get_media_file_size = lambda _: _LARGE_FILE_THRESHOLD
+    downloader._serialize_synthetic_media = lambda *_: False
+    downloader._download_small_media = AsyncMock(return_value=final_path)
+    downloader._download_large_media = AsyncMock(return_value=final_path)
+
+    result = await downloader.download_message_media(
+        {"id": 1, "media": media},
+        tmp_path,
+        overwrite_existing_files=False,
+    )
+
+    assert result == final_path
+    downloader._download_large_media.assert_awaited_once()
+    downloader._download_small_media.assert_not_awaited()
 
 
 def test_attachment_meta_is_inferred_without_downloaded_file():

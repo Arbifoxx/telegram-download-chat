@@ -24,7 +24,7 @@ settings:
   # Telegram Premium users can typically sustain higher values.
   download_concurrency: 5
 
-  # Cap for simultaneously active very large-file downloads (files >= 512 MB).
+  # Cap for simultaneously active large-file downloads (files >= 100 MB).
   # Keeping this lower than download_concurrency often improves sustained
   # throughput because Telegram frequently serves many big files from the
   # same DC connection, where too much parallelism can become bursty.
