@@ -39,6 +39,7 @@ class CLIOptions:
     export_pdf: bool = False
     media_placeholders: bool = False
     pause_file: Optional[str] = None
+    download_concurrency: Optional[int] = None
 
 
 def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
@@ -181,6 +182,13 @@ def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
         type=str,
         default=None,
         help="Path to a file whose presence signals a manual pause of media downloads",
+    )
+    parser.add_argument(
+        "--download-concurrency",
+        dest="download_concurrency",
+        type=int,
+        default=None,
+        help="Number of media files to download concurrently (overrides config)",
     )
 
     args = parser.parse_args(argv)

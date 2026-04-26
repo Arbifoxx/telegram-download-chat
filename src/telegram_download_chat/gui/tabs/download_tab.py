@@ -270,6 +270,13 @@ class DownloadTab(QWidget):
         self.media_chk = QCheckBox("Download images, videos, audio and all other files")
         settings_form.addRow("Download media:", self.media_chk)
 
+        # Concurrent media downloads
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, 100)
+        self.concurrency_spin.setValue(5)
+        self.concurrency_spin.setMaximumWidth(200)
+        settings_form.addRow("Concurrent downloads:", self.concurrency_spin)
+
         # HTML export
         self.html_chk = QCheckBox("Telegram-style interactive HTML")
         settings_form.addRow("HTML export:", self.html_chk)
@@ -531,6 +538,7 @@ class DownloadTab(QWidget):
         self.pause_btn.clicked.connect(self._on_pause_clicked)
         self.chat_edit.returnPressed.connect(self.start_download)
         self._is_manually_paused = False
+        self._current_download_file = None
 
     def _on_resume_clicked(self):
         self.resume_btn.hide()
@@ -552,6 +560,7 @@ class DownloadTab(QWidget):
     def update_file_info(self, filename: str, total_bytes: int):
         """Display the name of the file currently being downloaded."""
         if filename:
+            self._current_download_file = filename
             self.file_label.setText(f"Downloading: {filename}")
             self.file_label.setVisible(True)
             self.file_progress.setValue(0)
@@ -560,11 +569,14 @@ class DownloadTab(QWidget):
                 self.file_progress.setMaximum(total_bytes)
             self.file_progress.setVisible(total_bytes > 0)
         else:
+            self._current_download_file = None
             self.file_label.setVisible(False)
             self.file_progress.setVisible(False)
 
-    def update_file_progress(self, bytes_done: int, total_bytes: int):
-        """Update the per-file download progress bar."""
+    def update_file_progress(self, filename: str, bytes_done: int, total_bytes: int):
+        """Update the per-file download progress bar, ignoring other concurrent files."""
+        if filename != getattr(self, "_current_download_file", None):
+            return
         if total_bytes > 0:
             self.file_progress.setMaximum(total_bytes)
             self.file_progress.setValue(bytes_done)
@@ -625,6 +637,9 @@ class DownloadTab(QWidget):
             if "media" in settings:
                 self.media_chk.setChecked(settings["media"])
 
+            if "download_concurrency" in settings:
+                self.concurrency_spin.setValue(int(settings["download_concurrency"]))
+
             if "html" in settings:
                 self.html_chk.setChecked(settings["html"])
 
@@ -681,6 +696,7 @@ class DownloadTab(QWidget):
                     "debug": self.debug_chk.isChecked(),
                     "overwrite": self.overwrite_chk.isChecked(),
                     "media": self.media_chk.isChecked(),
+                    "download_concurrency": self.concurrency_spin.value(),
                     "html": self.html_chk.isChecked(),
                     "pdf": self.pdf_chk.isChecked(),
                     "sort": self.sort_combo.currentData() or "asc",
@@ -788,6 +804,8 @@ class DownloadTab(QWidget):
         if self.media_chk.isChecked():
             cmd_args.append("--media")
 
+        cmd_args.extend(["--download-concurrency", str(self.concurrency_spin.value())])
+
         if self.html_chk.isChecked():
             cmd_args.append("--html")
 
@@ -877,6 +895,7 @@ class DownloadTab(QWidget):
             self._start_loading_animation()
         else:
             self.resume_btn.hide()
+            self._current_download_file = None
             self.file_label.setVisible(False)
             self.file_progress.setVisible(False)
             self.progress.setMaximum(100)
@@ -987,6 +1006,7 @@ class DownloadTab(QWidget):
         settings["debug"] = self.debug_chk.isChecked()
         settings["overwrite"] = self.overwrite_chk.isChecked()
         settings["media"] = self.media_chk.isChecked()
+        settings["download_concurrency"] = self.concurrency_spin.value()
         settings["html"] = self.html_chk.isChecked()
         settings["pdf"] = self.pdf_chk.isChecked()
         settings["sort"] = self.sort_combo.currentData() or "asc"
@@ -1017,6 +1037,9 @@ class DownloadTab(QWidget):
         self.debug_chk.setChecked(bool(settings.get("debug", False)))
         self.overwrite_chk.setChecked(bool(settings.get("overwrite", False)))
         self.media_chk.setChecked(bool(settings.get("media", False)))
+        concurrency = settings.get("download_concurrency")
+        if concurrency is not None:
+            self.concurrency_spin.setValue(int(concurrency))
         self.html_chk.setChecked(bool(settings.get("html", False)))
         self.pdf_chk.setChecked(bool(settings.get("pdf", False)))
 

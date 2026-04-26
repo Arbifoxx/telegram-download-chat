@@ -175,6 +175,9 @@ async def async_main() -> int:
         if args.pause_file:
             downloader.set_pause_file(args.pause_file)
 
+        if args.download_concurrency is not None:
+            downloader.config.setdefault("settings", {})["download_concurrency"] = args.download_concurrency
+
         downloads_dir = Path(
             downloader.config.get("settings", {}).get("save_path", get_downloads_dir())
         )

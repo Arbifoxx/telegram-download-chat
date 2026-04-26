@@ -22,7 +22,7 @@ class WorkerThread(QThread):
     media_resumed = Signal()
     media_manually_paused = Signal()
     file_downloading = Signal(str, int)  # filename, total_bytes
-    file_progress = Signal(int, int)  # bytes_done, total_bytes
+    file_progress = Signal(str, int, int)  # filename, bytes_done, total_bytes
 
     def __init__(self, cmd_args, output_dir):
         """Initialize the worker thread.
@@ -146,7 +146,7 @@ class WorkerThread(QThread):
                     total = 0
                 if fname:
                     self.file_downloading.emit(fname, total)
-                    self.file_progress.emit(0, total)
+                    self.file_progress.emit(fname, 0, total)
         elif "media_file_progress:" in lower:
             marker = "MEDIA_FILE_PROGRESS:"
             idx = line.upper().find(marker)
@@ -156,9 +156,10 @@ class WorkerThread(QThread):
                 try:
                     right = raw.rsplit(":", 2)
                     if len(right) >= 3:
-                        done = int(right[-2])
-                        total = int(right[-1])
-                        self.file_progress.emit(done, total)
+                        fname = right[0]
+                        done = int(right[1])
+                        total = int(right[2])
+                        self.file_progress.emit(fname, done, total)
                 except (ValueError, IndexError):
                     pass
 
