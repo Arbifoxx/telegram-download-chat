@@ -177,6 +177,8 @@ async def async_main() -> int:
 
         if args.download_concurrency is not None:
             downloader.config.setdefault("settings", {})["download_concurrency"] = args.download_concurrency
+        if args.large_file_concurrency is not None:
+            downloader.config.setdefault("settings", {})["large_file_concurrency"] = args.large_file_concurrency
 
         downloads_dir = Path(
             downloader.config.get("settings", {}).get("save_path", get_downloads_dir())

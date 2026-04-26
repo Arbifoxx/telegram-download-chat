@@ -41,7 +41,7 @@ _CAT_LOCATIONS = "locations"
 _CAT_POLLS = "polls"
 _CAT_OTHER = "other"
 
-_LARGE_FILE_THRESHOLD = 128 * 1024 * 1024  # stream/resume files >= 128 MB
+_LARGE_FILE_THRESHOLD = 512 * 1024 * 1024  # stream/resume files >= 512 MB
 _CHUNK_SIZE = 512 * 1024               # 512 KB per request (Telegram's standard block)
 
 _ARCHIVE_MIMES = {
@@ -533,7 +533,7 @@ class MediaMixin:
             1,
             min(
                 CONCURRENCY,
-                int(settings.get("large_file_concurrency", 1) or 1),
+                int(settings.get("large_file_concurrency", 2) or 2),
             ),
         )
 

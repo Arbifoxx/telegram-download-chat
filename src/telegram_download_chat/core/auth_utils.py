@@ -141,8 +141,31 @@ class TelegramAuth:
                 self.api_hash,
                 **kwargs,
             )
+            self._log_crypto_backend()
             await self.client.connect()
             self._is_authenticated = await self.client.is_user_authorized()
+
+    def _log_crypto_backend(self) -> None:
+        """Log which Telethon AES backend is active for download performance."""
+        try:
+            from telethon.crypto import aes
+
+            if aes.cryptg is not None:
+                backend = "cryptg"
+            elif aes.libssl.decrypt_ige and aes.libssl.encrypt_ige:
+                backend = "libssl"
+            else:
+                backend = "python"
+
+            logger.info("Telethon crypto backend: %s", backend)
+            if backend == "python":
+                logger.warning(
+                    "Telethon is using the pure-Python AES backend. "
+                    "This can severely reduce media download speed, especially on Windows. "
+                    "Install cryptg for better performance."
+                )
+        except Exception as exc:
+            logger.debug("Unable to determine Telethon crypto backend: %s", exc)
 
     async def request_code(self, phone: str) -> Optional[str]:
         """Request a login code from Telegram.

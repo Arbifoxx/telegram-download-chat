@@ -279,6 +279,13 @@ class DownloadTab(QWidget):
         self.concurrency_spin.setMaximumWidth(200)
         settings_form.addRow("Concurrent downloads:", self.concurrency_spin)
 
+        # Very large file concurrency
+        self.large_file_concurrency_spin = QSpinBox()
+        self.large_file_concurrency_spin.setRange(1, 10)
+        self.large_file_concurrency_spin.setValue(2)
+        self.large_file_concurrency_spin.setMaximumWidth(200)
+        settings_form.addRow("Large file downloads:", self.large_file_concurrency_spin)
+
         # HTML export
         self.html_chk = QCheckBox("Telegram-style interactive HTML")
         settings_form.addRow("HTML export:", self.html_chk)
@@ -683,6 +690,11 @@ class DownloadTab(QWidget):
             if "download_concurrency" in settings:
                 self.concurrency_spin.setValue(int(settings["download_concurrency"]))
 
+            if "large_file_concurrency" in settings:
+                self.large_file_concurrency_spin.setValue(
+                    int(settings["large_file_concurrency"])
+                )
+
             if "html" in settings:
                 self.html_chk.setChecked(settings["html"])
 
@@ -740,6 +752,7 @@ class DownloadTab(QWidget):
                     "overwrite": self.overwrite_chk.isChecked(),
                     "media": self.media_chk.isChecked(),
                     "download_concurrency": self.concurrency_spin.value(),
+                    "large_file_concurrency": self.large_file_concurrency_spin.value(),
                     "html": self.html_chk.isChecked(),
                     "pdf": self.pdf_chk.isChecked(),
                     "sort": self.sort_combo.currentData() or "asc",
@@ -853,6 +866,12 @@ class DownloadTab(QWidget):
             cmd_args.append("--media")
 
         cmd_args.extend(["--download-concurrency", str(self.concurrency_spin.value())])
+        cmd_args.extend(
+            [
+                "--large-file-concurrency",
+                str(self.large_file_concurrency_spin.value()),
+            ]
+        )
 
         if self.html_chk.isChecked():
             if importlib.util.find_spec("jinja2") is None:
@@ -1047,6 +1066,7 @@ class DownloadTab(QWidget):
         settings["overwrite"] = self.overwrite_chk.isChecked()
         settings["media"] = self.media_chk.isChecked()
         settings["download_concurrency"] = self.concurrency_spin.value()
+        settings["large_file_concurrency"] = self.large_file_concurrency_spin.value()
         settings["html"] = self.html_chk.isChecked()
         settings["pdf"] = self.pdf_chk.isChecked()
         settings["sort"] = self.sort_combo.currentData() or "asc"
@@ -1080,6 +1100,9 @@ class DownloadTab(QWidget):
         concurrency = settings.get("download_concurrency")
         if concurrency is not None:
             self.concurrency_spin.setValue(int(concurrency))
+        large_file_concurrency = settings.get("large_file_concurrency")
+        if large_file_concurrency is not None:
+            self.large_file_concurrency_spin.setValue(int(large_file_concurrency))
         self.html_chk.setChecked(bool(settings.get("html", False)))
         self.pdf_chk.setChecked(bool(settings.get("pdf", False)))
 

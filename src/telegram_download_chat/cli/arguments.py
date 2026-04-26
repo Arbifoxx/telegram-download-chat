@@ -40,6 +40,7 @@ class CLIOptions:
     media_placeholders: bool = False
     pause_file: Optional[str] = None
     download_concurrency: Optional[int] = None
+    large_file_concurrency: Optional[int] = None
 
 
 def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
@@ -189,6 +190,13 @@ def parse_args(argv: Optional[list[str]] = None) -> CLIOptions:
         type=int,
         default=None,
         help="Number of media files to download concurrently (overrides config)",
+    )
+    parser.add_argument(
+        "--large-file-concurrency",
+        dest="large_file_concurrency",
+        type=int,
+        default=None,
+        help="Number of very large media files to download concurrently (overrides config)",
     )
 
     args = parser.parse_args(argv)
