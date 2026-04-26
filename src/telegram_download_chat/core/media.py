@@ -838,6 +838,7 @@ class MediaMixin:
         transport_window_started = time.monotonic()
         transport_window_bytes = 0
         transport_window_parts = 0
+        stall_started_at: Optional[float] = None
 
         async def claim_offset() -> Optional[int]:
             nonlocal next_offset
@@ -883,6 +884,27 @@ class MediaMixin:
             transport_window_bytes = 0
             transport_window_parts = 0
 
+        def emit_transport_stall(inflight: int) -> None:
+            nonlocal stall_started_at
+            if not self._media_transport_logs_enabled():
+                return
+            now = time.monotonic()
+            if stall_started_at is None:
+                stall_started_at = now - 1.0
+            stalled_for = now - stall_started_at
+            self._emit_media_transport_event(
+                filename,
+                "STALL",
+                inflight=inflight,
+                progress=bytes_done,
+                total=file_size,
+                stalled_ms=int(stalled_for * 1000),
+            )
+
+        def clear_transport_stall() -> None:
+            nonlocal stall_started_at
+            stall_started_at = None
+
         async def worker(session_index: int) -> None:
             session = await self._create_download_session(
                 file_info.dc_id,
@@ -927,7 +949,14 @@ class MediaMixin:
                     done, _ = await asyncio.wait(
                         pending.keys(),
                         return_when=asyncio.FIRST_COMPLETED,
+                        timeout=1.0,
                     )
+                    if not done:
+                        emit_transport_stall(len(pending))
+                        emit_transport_window(len(pending))
+                        continue
+
+                    clear_transport_stall()
                     for task in done:
                         offset = pending.pop(task)
                         try:
