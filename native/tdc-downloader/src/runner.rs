@@ -385,6 +385,17 @@ async fn handle_start_run(
                     .await?;
             }
             PreflightOutcome::Resume(state) => {
+                while active.len() >= max_concurrent_downloads {
+                    let should_break =
+                        settle_one_job(&mut active, &mut completed, &mut failed, &events)
+                            .await?;
+                    if should_break {
+                        break;
+                    }
+                }
+                if control.is_stop_requested() {
+                    break;
+                }
                 events
                     .emit(&Event::FileStarted {
                         file_id: job.file_id.clone(),
@@ -404,6 +415,17 @@ async fn handle_start_run(
                 );
             }
             PreflightOutcome::Restarted(state) => {
+                while active.len() >= max_concurrent_downloads {
+                    let should_break =
+                        settle_one_job(&mut active, &mut completed, &mut failed, &events)
+                            .await?;
+                    if should_break {
+                        break;
+                    }
+                }
+                if control.is_stop_requested() {
+                    break;
+                }
                 events
                     .emit(&Event::FileRestarted {
                         file_id: job.file_id.clone(),
@@ -429,16 +451,6 @@ async fn handle_start_run(
                     events.clone(),
                 );
             }
-        }
-
-        while active.len() >= max_concurrent_downloads {
-            let should_break = settle_one_job(&mut active, &mut completed, &mut failed, &events).await?;
-            if should_break {
-                break;
-            }
-        }
-        if control.is_stop_requested() {
-            break;
         }
     }
 
@@ -517,7 +529,7 @@ async fn download_job(
     job: DownloadJob,
     state: PartialState,
     auth_bundle: &AuthBundle,
-    settings: &crate::protocol::RunSettings,
+    _settings: &crate::protocol::RunSettings,
     control: &ControlState,
     events: &EventWriter,
 ) -> Result<DownloadOutcome, RunnerError> {
