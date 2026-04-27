@@ -2,6 +2,7 @@
 
 import importlib.util
 from pathlib import Path
+from time import monotonic
 from typing import Any, Dict
 
 from PySide6.QtCore import QDate, QModelIndex, QPropertyAnimation, Qt, QTimer, Signal
@@ -530,7 +531,7 @@ class DownloadTab(QWidget):
         self.pause_btn.clicked.connect(self._on_pause_clicked)
         self.chat_edit.returnPressed.connect(self.start_download)
         self._is_manually_paused = False
-        self._file_rows = {}  # fname -> (row_widget, label, bar)
+        self._file_rows = {}  # fname -> metadata for visible download rows
 
     def _on_resume_clicked(self):
         self.resume_btn.hide()
@@ -564,6 +565,8 @@ class DownloadTab(QWidget):
         """Add a progress row for a file that has started downloading."""
         if not filename or filename in self._file_rows:
             return
+        self._prune_file_rows(self._max_visible_file_rows() - 1)
+
         row = QWidget()
         row_layout = QVBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
@@ -589,8 +592,17 @@ class DownloadTab(QWidget):
         )
         row_layout.addWidget(bar)
 
+        now = monotonic()
         self._file_panel_layout.addWidget(row)
-        self._file_rows[filename] = (row, label, bar, total_bytes)
+        self._file_rows[filename] = {
+            "row": row,
+            "label": label,
+            "bar": bar,
+            "total_bytes": total_bytes,
+            "bytes_done": 0,
+            "started_at": now,
+            "last_update": now,
+        }
         self._file_panel.setVisible(True)
         self._file_panel.adjustSize()
         if self._file_panel.parent():
@@ -598,11 +610,15 @@ class DownloadTab(QWidget):
 
     def update_file_progress(self, filename: str, bytes_done: int, total_bytes: int):
         """Update a file's progress bar."""
+        if filename and filename not in self._file_rows and total_bytes > 0:
+            self.update_file_info(filename, total_bytes)
         entry = self._file_rows.get(filename)
         if not entry or total_bytes <= 0:
             return
-        _, _, bar, _ = entry
+        bar = entry["bar"]
         clamped_done = min(max(0, int(bytes_done)), int(total_bytes))
+        entry["bytes_done"] = clamped_done
+        entry["last_update"] = monotonic()
         scaled_value = min(1000, int(clamped_done * 1000 / total_bytes))
         bar.setRange(0, 1000)
         bar.setValue(scaled_value)
@@ -616,7 +632,8 @@ class DownloadTab(QWidget):
         entry = self._file_rows.get(filename)
         if not entry:
             return
-        _, label, bar, _ = entry
+        label = entry["label"]
+        bar = entry["bar"]
         label.setText(f"Done: {filename}")
         bar.setRange(0, 1)
         bar.setValue(1)
@@ -627,11 +644,26 @@ class DownloadTab(QWidget):
         entry = self._file_rows.pop(filename, None)
         if not entry:
             return
-        row, _, _, _ = entry
+        row = entry["row"]
         self._file_panel_layout.removeWidget(row)
         row.deleteLater()
         if not self._file_rows:
             self._file_panel.setVisible(False)
+
+    def _max_visible_file_rows(self) -> int:
+        return max(5, int(self.concurrency_spin.value()) + 3)
+
+    def _prune_file_rows(self, max_rows: int):
+        while len(self._file_rows) > max_rows:
+            candidate_name = min(
+                self._file_rows.items(),
+                key=lambda item: (
+                    0 if item[1]["bytes_done"] == 0 else 1,
+                    item[1]["last_update"],
+                    item[1]["started_at"],
+                ),
+            )[0]
+            self._remove_file_row(candidate_name)
 
     def _clear_file_panel(self):
         for filename in list(self._file_rows):

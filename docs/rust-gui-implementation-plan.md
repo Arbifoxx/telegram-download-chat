@@ -6,10 +6,11 @@ Replace the current Python GUI with a native Rust GUI built with `iced`, while k
 
 Primary goals:
 
-1. Include the downloader functions from the Python GUI.
+1. Include the downloader functions from the Python GUI with smoother download progress indicators rather than choppy, update-nearly-every-second indicators
 2. Include the login/authentication flow from the Python GUI.
 3. Do not include the current Convert functions/tab.
-4. Match the visual direction of the attached reference (reference.png at the root of the project, /Users/arbifox/tdesktop/telegram-download-chat/reference.png):
+4. Do not include the log, files, and preview windows from the Python downloader. The user has noted that they want a complete UI rework in accordance to step 5.
+5. Match the visual direction of the attached reference (reference.png at the root of the project, /Users/arbifox/tdesktop/telegram-download-chat/reference.png):
    - dark charcoal surfaces
    - purple accent color
    - rounded panels and inputs

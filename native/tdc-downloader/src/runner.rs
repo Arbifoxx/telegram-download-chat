@@ -30,6 +30,7 @@ const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024;
 const DEFAULT_LARGE_INFLIGHT: usize = 8;
 const WINDOW_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const SLOT_WAIT_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -584,7 +585,7 @@ async fn download_job(
         let guard = state_holder.lock().await;
         bytes_done_from_state(&guard, job.expected_size)
     };
-    let progress = Arc::new(ProgressTracker::new(initial_bytes));
+    let progress = Arc::new(ProgressTracker::new(initial_bytes, inflight));
 
     let monitor = tokio::spawn(monitor_progress(
         job.file_id.clone(),
@@ -712,7 +713,7 @@ async fn worker_loop(
         };
 
         let offset = chunk_index * CHUNK_SIZE;
-        progress.mark_inflight_start();
+        progress.acquire_slot(&control).await?;
         let result = fetch_chunk(
             &client,
             &native_client,
@@ -909,7 +910,7 @@ async fn monitor_progress(
     message_id: String,
     filename: String,
     total: u64,
-    inflight: usize,
+    configured_inflight: usize,
     progress: Arc<ProgressTracker>,
     control: ControlState,
     events: EventWriter,
@@ -924,6 +925,7 @@ async fn monitor_progress(
         let mbps = (bytes_delta as f64 * 8.0) / elapsed / 1_000_000.0;
         let completed_parts = (bytes_delta / CHUNK_SIZE) as usize;
         let inflight_now = progress.inflight();
+        let allowed_now = progress.allowed_inflight();
         events
             .emit(&Event::FileProgress {
                 file_id: file_id.clone(),
@@ -934,22 +936,29 @@ async fn monitor_progress(
             })
             .await?;
         if bytes_delta == 0 && inflight_now > 0 {
+            progress.reduce_allowed_inflight();
             events
                 .emit(&Event::TransportStall {
                     file_id: file_id.clone(),
                     filename: filename.clone(),
-                    inflight: inflight_now.max(inflight),
+                    inflight: inflight_now,
                     progress: current_bytes,
                     total,
                     stalled_ms: WINDOW_INTERVAL.as_millis() as u64,
                 })
                 .await?;
+        } else if bytes_delta > 0
+            && inflight_now >= allowed_now.saturating_sub(1)
+            && mbps >= 20.0
+            && completed_parts >= allowed_now.max(1) / 2
+        {
+            progress.increase_allowed_inflight();
         }
         events
             .emit(&Event::TransportWindow {
                 file_id: file_id.clone(),
                 filename: filename.clone(),
-                inflight: inflight_now.max(inflight),
+                inflight: inflight_now.min(configured_inflight),
                 mbps,
                 parts: completed_parts,
                 progress: current_bytes,
@@ -965,14 +974,20 @@ async fn monitor_progress(
 struct ProgressTracker {
     bytes_done: std::sync::atomic::AtomicU64,
     inflight: std::sync::atomic::AtomicUsize,
+    allowed_inflight: std::sync::atomic::AtomicUsize,
+    configured_inflight: usize,
     finished: std::sync::atomic::AtomicBool,
 }
 
 impl ProgressTracker {
-    fn new(initial_bytes: u64) -> Self {
+    fn new(initial_bytes: u64, configured_inflight: usize) -> Self {
+        let configured_inflight = configured_inflight.max(1);
+        let initial_allowed = configured_inflight.min(8).max(2);
         Self {
             bytes_done: std::sync::atomic::AtomicU64::new(initial_bytes),
             inflight: std::sync::atomic::AtomicUsize::new(0),
+            allowed_inflight: std::sync::atomic::AtomicUsize::new(initial_allowed),
+            configured_inflight,
             finished: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -986,8 +1001,36 @@ impl ProgressTracker {
         self.bytes_done.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn mark_inflight_start(&self) {
-        self.inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    async fn acquire_slot(&self, control: &ControlState) -> Result<(), RunnerError> {
+        loop {
+            if control.is_stop_requested() {
+                return Err(RunnerError::Grammers("download stopped".to_string()));
+            }
+            control.wait_if_paused().await;
+
+            let current = self.inflight.load(std::sync::atomic::Ordering::Relaxed);
+            let allowed = self
+                .allowed_inflight
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1);
+            if current < allowed {
+                if self
+                    .inflight
+                    .compare_exchange(
+                        current,
+                        current + 1,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            sleep(SLOT_WAIT_INTERVAL).await;
+        }
     }
 
     fn mark_inflight_end(&self) {
@@ -996,6 +1039,34 @@ impl ProgressTracker {
 
     fn inflight(&self) -> usize {
         self.inflight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn allowed_inflight(&self) -> usize {
+        self.allowed_inflight
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1)
+    }
+
+    fn reduce_allowed_inflight(&self) {
+        let current = self.allowed_inflight();
+        let reduced = if current >= 8 {
+            current.saturating_sub(2)
+        } else {
+            current.saturating_sub(1)
+        }
+        .max(2);
+        self.allowed_inflight
+            .store(reduced, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn increase_allowed_inflight(&self) {
+        let current = self.allowed_inflight();
+        if current < self.configured_inflight {
+            self.allowed_inflight.store(
+                current + 1,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     fn mark_finished(&self) {
