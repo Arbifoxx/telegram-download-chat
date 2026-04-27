@@ -225,19 +225,22 @@ class NativeMediaBackend:
     async def _build_auth_bundle(self, dc_ids: List[int]) -> Dict[str, Any]:
         settings = self.downloader.config.get("settings", {})
         config = await self.downloader.client(functions.help.GetConfigRequest())
-        dc_options = []
+        preferred_dc_options: Dict[int, Dict[str, Any]] = {}
         for option in config.dc_options:
-            dc_options.append(
-                {
-                    "id": option.id,
-                    "ip_address": option.ip_address,
-                    "port": option.port,
-                    "ipv6": bool(getattr(option, "ipv6", False)),
-                    "media_only": bool(getattr(option, "media_only", False)),
-                    "cdn": bool(getattr(option, "cdn", False)),
-                    "tcpo_only": bool(getattr(option, "tcpo_only", False)),
-                }
-            )
+            normalized = {
+                "id": option.id,
+                "ip_address": option.ip_address,
+                "port": option.port,
+                "ipv6": bool(getattr(option, "ipv6", False)),
+                "media_only": bool(getattr(option, "media_only", False)),
+                "cdn": bool(getattr(option, "cdn", False)),
+                "tcpo_only": bool(getattr(option, "tcpo_only", False)),
+            }
+            existing = preferred_dc_options.get(option.id)
+            if existing is None or self._score_dc_option(normalized) > self._score_dc_option(
+                existing
+            ):
+                preferred_dc_options[option.id] = normalized
 
         current_dc = int(getattr(self.downloader.client.session, "dc_id", 0) or 0)
         exported_auth = {}
@@ -261,9 +264,25 @@ class NativeMediaBackend:
             ).decode("ascii"),
             "self_id": self.downloader._self_id,
             "self_name": self.downloader._self_name,
-            "dc_options": dc_options,
+            "dc_options": [
+                preferred_dc_options[dc_id]
+                for dc_id in sorted(preferred_dc_options.keys())
+            ],
             "exported_auth": exported_auth,
         }
+
+    @staticmethod
+    def _score_dc_option(option: Dict[str, Any]) -> int:
+        score = 0
+        if not option.get("ipv6", False):
+            score += 100
+        if not option.get("cdn", False):
+            score += 20
+        if not option.get("media_only", False):
+            score += 10
+        if not option.get("tcpo_only", False):
+            score += 5
+        return score
 
     async def _run_backend(
         self,
