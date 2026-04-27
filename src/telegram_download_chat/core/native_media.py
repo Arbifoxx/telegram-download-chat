@@ -256,6 +256,9 @@ class NativeMediaBackend:
             "api_id": int(settings.get("api_id")),
             "api_hash": settings.get("api_hash"),
             "current_dc_id": current_dc,
+            "home_auth_key_b64": base64.b64encode(
+                getattr(self.downloader.client.session.auth_key, "key", b"") or b""
+            ).decode("ascii"),
             "self_id": self.downloader._self_id,
             "self_name": self.downloader._self_name,
             "dc_options": dc_options,
@@ -375,6 +378,17 @@ class NativeMediaBackend:
         elif event_type == "file_restarted":
             self.logger.info(
                 f"MEDIA_RESTARTED:{event.get('filename') or event.get('file_id', '')}"
+            )
+        elif event_type == "transport_pipeline":
+            self.logger.info(
+                "MEDIA_TRANSPORT_PIPELINE:"
+                f"{event.get('filename') or event.get('file_id', '')}:"
+                f"dc={event.get('dc_id', 0)}:"
+                f"inflight={event.get('inflight', 0)}:"
+                f"large={1 if event.get('large') else 0}:"
+                f"requested_pipeline={event.get('requested_pipeline', 0)}:"
+                f"requested_sessions={event.get('requested_sessions', 0)}:"
+                f"worker={event.get('worker', 0)}"
             )
         elif event_type == "transport_window":
             self.logger.info(

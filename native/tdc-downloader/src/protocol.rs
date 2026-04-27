@@ -48,6 +48,8 @@ pub struct AuthBundle {
     #[serde(default)]
     pub current_dc_id: i32,
     #[serde(default)]
+    pub home_auth_key_b64: String,
+    #[serde(default)]
     pub self_id: Option<i64>,
     #[serde(default)]
     pub self_name: Option<String>,
@@ -163,6 +165,16 @@ pub enum Event {
         file_id: String,
         message_id: String,
         filename: String,
+    },
+    TransportPipeline {
+        file_id: String,
+        filename: String,
+        dc_id: i32,
+        inflight: usize,
+        large: bool,
+        requested_pipeline: usize,
+        requested_sessions: usize,
+        worker: usize,
     },
     FileError {
         file_id: String,

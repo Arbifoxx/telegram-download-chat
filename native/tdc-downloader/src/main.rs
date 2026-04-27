@@ -9,7 +9,7 @@ use std::env;
 fn capabilities() -> Capabilities {
     Capabilities {
         protocol_version: 1,
-        transport_ready: false,
+        transport_ready: true,
         resume_ready: true,
         commands: vec![
             "start_run",
@@ -26,6 +26,7 @@ fn capabilities() -> Capabilities {
             "file_completed",
             "file_skipped",
             "file_restarted",
+            "transport_pipeline",
             "file_error",
             "transport_window",
             "transport_stall",
@@ -49,11 +50,17 @@ fn main() {
             );
         }
         "run" => {
-            let mut runner = Runner::stdio();
-            if let Err(error) = runner.run() {
-                eprintln!("{error}");
-                std::process::exit(1);
-            }
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build tokio runtime");
+            runtime.block_on(async {
+                let mut runner = Runner::stdio();
+                if let Err(error) = runner.run().await {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            });
         }
         _ => {
             eprintln!("usage: tdc-downloader <capabilities|run>");
