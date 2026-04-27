@@ -25,8 +25,8 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 const CHUNK_SIZE: u64 = 128 * 1024;
+const MEDIUM_FILE_THRESHOLD: u64 = 16 * 1024 * 1024;
 const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024;
-const DEFAULT_SMALL_INFLIGHT: usize = 4;
 const DEFAULT_LARGE_INFLIGHT: usize = 8;
 const WINDOW_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -487,16 +487,21 @@ async fn download_job(
     events: &EventWriter,
 ) -> Result<DownloadOutcome, RunnerError> {
     let location = parse_input_location(&job.location)?;
+    let medium = job.expected_size >= MEDIUM_FILE_THRESHOLD;
     let large = job.expected_size >= LARGE_FILE_THRESHOLD;
     let requested_sessions = if large {
         settings.large_file_concurrency.max(1)
+    } else if medium {
+        settings.large_file_concurrency.clamp(2, 3)
     } else {
         1
     };
-    let requested_pipeline = if large { 4usize } else { 2usize };
+    let requested_pipeline = if large || medium { 4usize } else { 2usize };
     let requested_sessions = requested_sessions.min(client_pool.len()).max(1);
     let inflight = if large {
         (requested_sessions * requested_pipeline).clamp(DEFAULT_LARGE_INFLIGHT, 32)
+    } else if medium {
+        (requested_sessions * requested_pipeline).clamp(4, 12)
     } else {
         requested_pipeline.clamp(1, 8)
     };

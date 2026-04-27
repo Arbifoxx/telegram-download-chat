@@ -299,31 +299,49 @@ class NativeMediaBackend:
 
         await self._send_command(process, start_command)
         fatal_error: Optional[str] = None
+        stop_sent = False
 
-        assert process.stdout is not None
-        while True:
-            if self.downloader._stop_requested:
-                await self._send_command(process, {"type": "stop"})
+        try:
+            assert process.stdout is not None
+            while True:
+                if self.downloader._stop_requested and not stop_sent:
+                    await self._send_command(process, {"type": "stop"})
+                    stop_sent = True
 
-            await self._sync_pause_state(process)
+                await self._sync_pause_state(process)
 
-            raw = await process.stdout.readline()
-            if not raw:
-                break
+                raw = await process.stdout.readline()
+                if not raw:
+                    break
 
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
 
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                self.logger.info(line)
-                continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    self.logger.info(line)
+                    continue
 
-            fatal_error = await self._handle_event(process, event) or fatal_error
+                fatal_error = await self._handle_event(process, event) or fatal_error
+        finally:
+            if process.returncode is None:
+                if self.downloader._stop_requested:
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=1.5)
+                    except asyncio.TimeoutError:
+                        process.terminate()
+                if process.returncode is None:
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=1.5)
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.wait()
 
-        returncode = await process.wait()
+        returncode = process.returncode
+        if returncode is None:
+            returncode = await process.wait()
         if returncode == 0 and fatal_error is None:
             return dict(self._results)
 
