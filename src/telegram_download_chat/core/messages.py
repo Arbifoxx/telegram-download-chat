@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..paths import get_relative_to_downloads_dir
+from .native_media import NativeMediaBackend
 
 
 class MessagesMixin:
@@ -422,11 +423,18 @@ class MessagesMixin:
         # Download media attachments if requested
         if download_media:
             self.logger.info("Downloading media attachments...")
-            download_results = await self.download_all_media(
+            native_backend = NativeMediaBackend(self)
+            download_results = await native_backend.download_all_media(
                 messages,
                 attachments_dir,
                 overwrite_existing_files=overwrite_existing_files,
             )
+            if download_results is None:
+                download_results = await self.download_all_media(
+                    messages,
+                    attachments_dir,
+                    overwrite_existing_files=overwrite_existing_files,
+                )
             # Reconcile predicted paths with actual download results:
             # - null out attachment_path for messages whose downloads failed
             # - update attachment_path when Telethon used a different filename

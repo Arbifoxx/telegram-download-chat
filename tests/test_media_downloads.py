@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 try:
@@ -20,6 +21,7 @@ from telegram_download_chat.core.media import (
     _CHUNK_SIZE,
     _LARGE_FILE_THRESHOLD,
 )
+from telegram_download_chat.core.native_media import NativeMediaBackend, _native_json
 from telegram_download_chat.core.render import _attachment_meta_from_message
 
 
@@ -354,3 +356,73 @@ def test_attachment_meta_is_inferred_without_downloaded_file():
     assert meta["media_category"] == "archives"
     assert meta["attachment_filename"] == "1A420.tar.bz2"
     assert meta["attachment_size_label"] == "105.0 MB"
+
+
+def test_native_json_encodes_bytes_recursively():
+    payload = {
+        "root": b"\x01\x02",
+        "nested": [b"\x03", {"leaf": b"\x04"}],
+    }
+
+    encoded = _native_json(payload)
+
+    assert encoded["root"]["__bytes_b64__"] == "AQI="
+    assert encoded["nested"][0]["__bytes_b64__"] == "Aw=="
+    assert encoded["nested"][1]["leaf"]["__bytes_b64__"] == "BA=="
+
+
+def test_native_media_backend_builds_manifest_jobs(tmp_path):
+    downloader = DummyDownloader()
+    downloader.config["settings"].update({"api_id": "1", "api_hash": "hash"})
+    downloader.get_filename = lambda _: "asset.bin"
+    downloader._get_media_category = lambda _: "documents"
+    downloader._get_media_file_size = lambda _: 1234
+    downloader._get_direct_download_source = lambda message, media: object()
+
+    message = SimpleNamespace(
+        id=42,
+        media=object(),
+        input_chat=SimpleNamespace(to_dict=lambda: {"_": "InputPeerChannel", "channel_id": 99}),
+    )
+
+    class FakeFileInfo:
+        location = SimpleNamespace(to_dict=lambda: {"_": "InputDocumentFileLocation", "id": 7, "file_reference": b"abc"})
+        dc_id = 2
+
+    original_get_file_info = media_module.utils._get_file_info
+    media_module.utils._get_file_info = lambda _: FakeFileInfo()
+    try:
+        backend = NativeMediaBackend(downloader)
+        jobs = backend._build_jobs([message], tmp_path, overwrite_existing_files=False)
+    finally:
+        media_module.utils._get_file_info = original_get_file_info
+
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["file_id"] == "42:asset.bin"
+    assert job["final_path"].endswith("documents/42_asset.bin")
+    assert job["temp_path"].endswith("documents/42_asset.bin.part")
+    assert job["state_path"].endswith("documents/42_asset.bin.part.state.json")
+    assert job["expected_size"] == 1234
+    assert job["dc_id"] == 2
+    assert job["location"]["file_reference"]["__bytes_b64__"] == "YWJj"
+
+
+@pytest.mark.asyncio
+async def test_native_media_backend_returns_none_when_transport_not_ready(tmp_path):
+    downloader = DummyDownloader()
+    backend = NativeMediaBackend(downloader)
+    backend._read_capabilities = AsyncMock(
+        return_value={"protocol_version": 1, "transport_ready": False}
+    )
+
+    from telegram_download_chat.core import native_media as native_media_module
+
+    original_locate_native = native_media_module.locate_native_downloader_binary
+    native_media_module.locate_native_downloader_binary = lambda: tmp_path / "tdc-downloader"
+    try:
+        result = await backend.download_all_media([], tmp_path)
+    finally:
+        native_media_module.locate_native_downloader_binary = original_locate_native
+
+    assert result is None
