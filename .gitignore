@@ -82,6 +82,8 @@ coverage.xml
 Thumbs.db
 *.tar.gz
 *.zip
+native/tdc-downloader/target/
+tdesktop
 
 # Version files
 =10.0.0

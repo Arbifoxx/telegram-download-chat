@@ -301,7 +301,7 @@ impl NativeClientContext {
             .invoke_in_dc(
                 dc_id,
                 &tl::functions::auth::ImportAuthorization {
-                    id: i64::from(auth.id),
+                    id: auth.id,
                     bytes,
                 },
             )

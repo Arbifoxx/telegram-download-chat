@@ -76,7 +76,7 @@ pub struct DcOption {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExportedAuth {
-    pub id: i32,
+    pub id: i64,
     pub bytes_b64: String,
 }
 
