@@ -37,8 +37,6 @@ pub struct StartRunCommand {
 pub struct RunSettings {
     #[serde(default)]
     pub download_concurrency: usize,
-    #[serde(default)]
-    pub large_file_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

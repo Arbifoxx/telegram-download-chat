@@ -114,12 +114,6 @@ class NativeMediaBackend:
                     )
                     or 5
                 ),
-                "large_file_concurrency": int(
-                    self.downloader.config.get("settings", {}).get(
-                        "large_file_concurrency", 2
-                    )
-                    or 2
-                ),
             },
             "auth_bundle": auth_bundle,
             "jobs": jobs,
@@ -300,6 +294,7 @@ class NativeMediaBackend:
         await self._send_command(process, start_command)
         fatal_error: Optional[str] = None
         stop_sent = False
+        stop_requested_at: Optional[float] = None
 
         try:
             assert process.stdout is not None
@@ -307,10 +302,24 @@ class NativeMediaBackend:
                 if self.downloader._stop_requested and not stop_sent:
                     await self._send_command(process, {"type": "stop"})
                     stop_sent = True
+                    stop_requested_at = asyncio.get_running_loop().time()
+
+                if (
+                    stop_sent
+                    and stop_requested_at is not None
+                    and asyncio.get_running_loop().time() - stop_requested_at >= 0.5
+                ):
+                    break
 
                 await self._sync_pause_state(process)
 
-                raw = await process.stdout.readline()
+                try:
+                    raw = await asyncio.wait_for(
+                        process.stdout.readline(),
+                        timeout=0.2,
+                    )
+                except asyncio.TimeoutError:
+                    continue
                 if not raw:
                     break
 

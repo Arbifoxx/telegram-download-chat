@@ -360,11 +360,11 @@ async fn handle_start_run(
         })
         .await?;
 
-    let max_sessions = start.settings.large_file_concurrency.clamp(1, 8);
-    let client_pool = NativeClientPool::from_auth_bundle(&start.auth_bundle, max_sessions).await?;
+    let max_concurrent_downloads = start.settings.download_concurrency.clamp(1, 5);
     let mut completed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
+    let mut active = tokio::task::JoinSet::new();
 
     for job in &start.jobs {
         if control.is_stop_requested() {
@@ -393,30 +393,15 @@ async fn handle_start_run(
                         expected_size: job.expected_size,
                     })
                     .await?;
-                match download_job(
+                spawn_job(
+                    &mut active,
                     job.clone(),
                     state,
-                    &start.settings,
-                    &client_pool,
-                    &control,
-                    &events,
-                )
-                .await
-                {
-                    Ok(DownloadOutcome::Completed) => completed += 1,
-                    Ok(DownloadOutcome::Stopped) => break,
-                    Err(error) => {
-                        failed += 1;
-                        events
-                            .emit(&Event::FileError {
-                                file_id: job.file_id.clone(),
-                                message_id: job.message_id.clone(),
-                                filename: job.filename.clone(),
-                                message: error.to_string(),
-                            })
-                            .await?;
-                    }
-                }
+                    start.auth_bundle.clone(),
+                    start.settings.clone(),
+                    control.clone(),
+                    events.clone(),
+                );
             }
             PreflightOutcome::Restarted(state) => {
                 events
@@ -434,35 +419,35 @@ async fn handle_start_run(
                         expected_size: job.expected_size,
                     })
                     .await?;
-                match download_job(
+                spawn_job(
+                    &mut active,
                     job.clone(),
                     state,
-                    &start.settings,
-                    &client_pool,
-                    &control,
-                    &events,
-                )
-                .await
-                {
-                    Ok(DownloadOutcome::Completed) => completed += 1,
-                    Ok(DownloadOutcome::Stopped) => break,
-                    Err(error) => {
-                        failed += 1;
-                        events
-                            .emit(&Event::FileError {
-                                file_id: job.file_id.clone(),
-                                message_id: job.message_id.clone(),
-                                filename: job.filename.clone(),
-                                message: error.to_string(),
-                            })
-                            .await?;
-                    }
-                }
+                    start.auth_bundle.clone(),
+                    start.settings.clone(),
+                    control.clone(),
+                    events.clone(),
+                );
             }
+        }
+
+        while active.len() >= max_concurrent_downloads {
+            let should_break = settle_one_job(&mut active, &mut completed, &mut failed, &events).await?;
+            if should_break {
+                break;
+            }
+        }
+        if control.is_stop_requested() {
+            break;
         }
     }
 
-    client_pool.shutdown().await;
+    while !active.is_empty() {
+        let should_break = settle_one_job(&mut active, &mut completed, &mut failed, &events).await?;
+        if should_break {
+            break;
+        }
+    }
     events
         .emit(&Event::RunSummary {
             completed,
@@ -473,6 +458,56 @@ async fn handle_start_run(
     Ok(())
 }
 
+fn spawn_job(
+    active: &mut tokio::task::JoinSet<Result<DownloadOutcome, RunnerError>>,
+    job: DownloadJob,
+    state: PartialState,
+    auth_bundle: AuthBundle,
+    settings: crate::protocol::RunSettings,
+    control: ControlState,
+    events: EventWriter,
+) {
+    active.spawn(async move {
+        download_job(job, state, &auth_bundle, &settings, &control, &events).await
+    });
+}
+
+async fn settle_one_job(
+    active: &mut tokio::task::JoinSet<Result<DownloadOutcome, RunnerError>>,
+    completed: &mut usize,
+    failed: &mut usize,
+    events: &EventWriter,
+) -> Result<bool, RunnerError> {
+    let Some(result) = active.join_next().await else {
+        return Ok(false);
+    };
+    match result {
+        Ok(Ok(DownloadOutcome::Completed)) => {
+            *completed += 1;
+            Ok(false)
+        }
+        Ok(Ok(DownloadOutcome::Stopped)) => Ok(true),
+        Ok(Err(error)) => {
+            *failed += 1;
+            events
+                .emit(&Event::FatalError {
+                    message: error.to_string(),
+                })
+                .await?;
+            Ok(false)
+        }
+        Err(error) => {
+            *failed += 1;
+            events
+                .emit(&Event::FatalError {
+                    message: error.to_string(),
+                })
+                .await?;
+            Ok(false)
+        }
+    }
+}
+
 enum DownloadOutcome {
     Completed,
     Stopped,
@@ -481,8 +516,8 @@ enum DownloadOutcome {
 async fn download_job(
     job: DownloadJob,
     state: PartialState,
+    auth_bundle: &AuthBundle,
     settings: &crate::protocol::RunSettings,
-    client_pool: &NativeClientPool,
     control: &ControlState,
     events: &EventWriter,
 ) -> Result<DownloadOutcome, RunnerError> {
@@ -490,13 +525,14 @@ async fn download_job(
     let medium = job.expected_size >= MEDIUM_FILE_THRESHOLD;
     let large = job.expected_size >= LARGE_FILE_THRESHOLD;
     let requested_sessions = if large {
-        settings.large_file_concurrency.max(1)
+        5
     } else if medium {
-        settings.large_file_concurrency.clamp(2, 3)
+        3
     } else {
         1
     };
     let requested_pipeline = if large || medium { 4usize } else { 2usize };
+    let client_pool = NativeClientPool::from_auth_bundle(auth_bundle, requested_sessions).await?;
     let requested_sessions = requested_sessions.min(client_pool.len()).max(1);
     let inflight = if large {
         (requested_sessions * requested_pipeline).clamp(DEFAULT_LARGE_INFLIGHT, 32)
@@ -519,10 +555,12 @@ async fn download_job(
         })
         .await?;
 
-    client_pool
-        .first()
-        .ensure_dc_authorized(job.dc_id, control, events)
-        .await?;
+    for session_index in 0..requested_sessions {
+        client_pool
+            .get(session_index)
+            .ensure_dc_authorized(job.dc_id, control, events)
+            .await?;
+    }
 
     let file = prepare_temp_file(&job).await?;
     let file = Arc::new(Mutex::new(file));
@@ -601,13 +639,16 @@ async fn download_job(
     let _ = monitor.await;
 
     if control.is_stop_requested() {
+        client_pool.shutdown().await;
         return Ok(DownloadOutcome::Stopped);
     }
     if let Some(error) = first_error {
+        client_pool.shutdown().await;
         return Err(error);
     }
 
     finalize_job(&job).await?;
+    client_pool.shutdown().await;
     events
         .emit(&Event::FileCompleted {
             file_id: job.file_id.clone(),

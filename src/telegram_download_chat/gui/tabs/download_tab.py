@@ -274,17 +274,10 @@ class DownloadTab(QWidget):
 
         # Concurrent media downloads
         self.concurrency_spin = QSpinBox()
-        self.concurrency_spin.setRange(1, 100)
+        self.concurrency_spin.setRange(1, 5)
         self.concurrency_spin.setValue(5)
         self.concurrency_spin.setMaximumWidth(200)
         settings_form.addRow("Concurrent downloads:", self.concurrency_spin)
-
-        # Very large file concurrency
-        self.large_file_concurrency_spin = QSpinBox()
-        self.large_file_concurrency_spin.setRange(1, 10)
-        self.large_file_concurrency_spin.setValue(2)
-        self.large_file_concurrency_spin.setMaximumWidth(200)
-        settings_form.addRow("Large file downloads:", self.large_file_concurrency_spin)
 
         # Per-file progress log spam toggle
         self.media_progress_logs_chk = QCheckBox(
@@ -701,11 +694,6 @@ class DownloadTab(QWidget):
             if "download_concurrency" in settings:
                 self.concurrency_spin.setValue(int(settings["download_concurrency"]))
 
-            if "large_file_concurrency" in settings:
-                self.large_file_concurrency_spin.setValue(
-                    int(settings["large_file_concurrency"])
-                )
-
             if "media_progress_logs" in settings:
                 self.media_progress_logs_chk.setChecked(
                     bool(settings["media_progress_logs"])
@@ -773,7 +761,6 @@ class DownloadTab(QWidget):
                     "overwrite": self.overwrite_chk.isChecked(),
                     "media": self.media_chk.isChecked(),
                     "download_concurrency": self.concurrency_spin.value(),
-                    "large_file_concurrency": self.large_file_concurrency_spin.value(),
                     "media_progress_logs": self.media_progress_logs_chk.isChecked(),
                     "media_transport_logs": self.media_transport_logs_chk.isChecked(),
                     "html": self.html_chk.isChecked(),
@@ -889,12 +876,6 @@ class DownloadTab(QWidget):
             cmd_args.append("--media")
 
         cmd_args.extend(["--download-concurrency", str(self.concurrency_spin.value())])
-        cmd_args.extend(
-            [
-                "--large-file-concurrency",
-                str(self.large_file_concurrency_spin.value()),
-            ]
-        )
         if self.media_progress_logs_chk.isChecked():
             cmd_args.append("--media-progress-logs")
         if self.media_transport_logs_chk.isChecked():
@@ -1093,7 +1074,6 @@ class DownloadTab(QWidget):
         settings["overwrite"] = self.overwrite_chk.isChecked()
         settings["media"] = self.media_chk.isChecked()
         settings["download_concurrency"] = self.concurrency_spin.value()
-        settings["large_file_concurrency"] = self.large_file_concurrency_spin.value()
         settings["media_progress_logs"] = self.media_progress_logs_chk.isChecked()
         settings["html"] = self.html_chk.isChecked()
         settings["pdf"] = self.pdf_chk.isChecked()
@@ -1128,9 +1108,6 @@ class DownloadTab(QWidget):
         concurrency = settings.get("download_concurrency")
         if concurrency is not None:
             self.concurrency_spin.setValue(int(concurrency))
-        large_file_concurrency = settings.get("large_file_concurrency")
-        if large_file_concurrency is not None:
-            self.large_file_concurrency_spin.setValue(int(large_file_concurrency))
         self.media_progress_logs_chk.setChecked(
             bool(settings.get("media_progress_logs", False))
         )
