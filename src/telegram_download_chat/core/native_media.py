@@ -59,6 +59,7 @@ class NativeMediaBackend:
         self._message_lookup: Dict[str, Any] = {}
         self._jobs_by_id: Dict[str, Dict[str, Any]] = {}
         self._results: Dict[str, str] = {}
+        self._ui_announced_files: set[str] = set()
 
     async def download_all_media(
         self,
@@ -398,14 +399,16 @@ class NativeMediaBackend:
                 f"RUST_MEDIA_RUN_STARTED:{event.get('run_id', '')}:{event.get('file_count', 0)}"
             )
         elif event_type == "file_started":
-            filename = event.get("filename") or event.get("file_id", "")
-            total = int(event.get("expected_size") or 0)
-            self.logger.info(f"MEDIA_DOWNLOADING:{filename}:{total}")
-            self.logger.info(f"MEDIA_FILE_PROGRESS:{filename}:0:{total}")
+            # Don't surface a file into the GUI yet; wait until it reports
+            # real byte progress so the visible list reflects active work.
+            pass
         elif event_type == "file_progress":
             filename = event.get("filename") or event.get("file_id", "")
             done = int(event.get("bytes_done") or 0)
             total = int(event.get("expected_size") or 0)
+            if filename and filename not in self._ui_announced_files and done > 0:
+                self._ui_announced_files.add(filename)
+                self.logger.info(f"MEDIA_DOWNLOADING:{filename}:{total}")
             self.logger.info(f"MEDIA_FILE_PROGRESS:{filename}:{done}:{total}")
         elif event_type == "file_completed":
             filename = event.get("filename") or event.get("file_id", "")
@@ -413,6 +416,7 @@ class NativeMediaBackend:
             message_id = str(event.get("message_id") or "")
             if message_id and final_rel:
                 self._results[message_id] = final_rel
+            self._ui_announced_files.discard(filename)
             self.logger.info(f"MEDIA_DOWNLOADED:{filename}")
         elif event_type == "file_skipped":
             filename = event.get("filename") or event.get("file_id", "")
@@ -420,6 +424,7 @@ class NativeMediaBackend:
             message_id = str(event.get("message_id") or "")
             if message_id and final_rel:
                 self._results[message_id] = final_rel
+            self._ui_announced_files.discard(filename)
             self.logger.info(f"MEDIA_DOWNLOADED:{filename}")
         elif event_type == "file_restarted":
             self.logger.info(

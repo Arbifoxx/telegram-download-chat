@@ -9,7 +9,8 @@ Primary goals:
 1. Include the downloader functions from the Python GUI with smoother download progress indicators rather than choppy, update-nearly-every-second indicators
 2. Include the login/authentication flow from the Python GUI.
 3. Do not include the current Convert functions/tab.
-4. Do not include the log, files, and preview windows from the Python downloader. The user has noted that they want a complete UI rework in accordance to step 5.
+4. Do not include the log, files, and preview windows from the Python downloader. The user has noted that they want a complete UI rework/refresh in accordance to step 5.
+   - While the user does not want a log window, a log file should still be created in the directory the user specifies as the download location in order to debug issues 
 5. Match the visual direction of the attached reference (reference.png at the root of the project, /Users/arbifox/tdesktop/telegram-download-chat/reference.png):
    - dark charcoal surfaces
    - purple accent color
@@ -25,7 +26,6 @@ The Rust GUI should eventually become the main desktop app for:
 - Chat/channel download configuration
 - Starting/stopping/pausing/resuming downloads
 - Showing file progress and overall progress
-- Showing useful logs/status text
 - Opening output/download folders
 
 Out of scope for the Rust GUI first release:
