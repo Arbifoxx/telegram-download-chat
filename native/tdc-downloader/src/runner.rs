@@ -312,6 +312,42 @@ impl NativeClientContext {
     }
 }
 
+struct NativeClientPool {
+    contexts: Vec<NativeClientContext>,
+}
+
+impl NativeClientPool {
+    async fn from_auth_bundle(
+        auth_bundle: &AuthBundle,
+        count: usize,
+    ) -> Result<Self, RunnerError> {
+        let count = count.max(1);
+        let mut contexts = Vec::with_capacity(count);
+        for _ in 0..count {
+            contexts.push(NativeClientContext::from_auth_bundle(auth_bundle).await?);
+        }
+        Ok(Self { contexts })
+    }
+
+    fn len(&self) -> usize {
+        self.contexts.len()
+    }
+
+    fn first(&self) -> &NativeClientContext {
+        &self.contexts[0]
+    }
+
+    fn get(&self, index: usize) -> &NativeClientContext {
+        &self.contexts[index % self.contexts.len()]
+    }
+
+    async fn shutdown(&self) {
+        for context in &self.contexts {
+            context.shutdown().await;
+        }
+    }
+}
+
 async fn handle_start_run(
     start: StartRunCommand,
     control: ControlState,
@@ -324,7 +360,8 @@ async fn handle_start_run(
         })
         .await?;
 
-    let client = NativeClientContext::from_auth_bundle(&start.auth_bundle).await?;
+    let max_sessions = start.settings.large_file_concurrency.clamp(1, 8);
+    let client_pool = NativeClientPool::from_auth_bundle(&start.auth_bundle, max_sessions).await?;
     let mut completed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -359,9 +396,8 @@ async fn handle_start_run(
                 match download_job(
                     job.clone(),
                     state,
-                    &start.auth_bundle,
                     &start.settings,
-                    &client,
+                    &client_pool,
                     &control,
                     &events,
                 )
@@ -401,9 +437,8 @@ async fn handle_start_run(
                 match download_job(
                     job.clone(),
                     state,
-                    &start.auth_bundle,
                     &start.settings,
-                    &client,
+                    &client_pool,
                     &control,
                     &events,
                 )
@@ -427,7 +462,7 @@ async fn handle_start_run(
         }
     }
 
-    client.shutdown().await;
+    client_pool.shutdown().await;
     events
         .emit(&Event::RunSummary {
             completed,
@@ -446,9 +481,8 @@ enum DownloadOutcome {
 async fn download_job(
     job: DownloadJob,
     state: PartialState,
-    _auth_bundle: &AuthBundle,
     settings: &crate::protocol::RunSettings,
-    client: &NativeClientContext,
+    client_pool: &NativeClientPool,
     control: &ControlState,
     events: &EventWriter,
 ) -> Result<DownloadOutcome, RunnerError> {
@@ -460,10 +494,11 @@ async fn download_job(
         1
     };
     let requested_pipeline = if large { 4usize } else { 2usize };
+    let requested_sessions = requested_sessions.min(client_pool.len()).max(1);
     let inflight = if large {
-        (requested_sessions * 2).clamp(DEFAULT_LARGE_INFLIGHT, 16)
+        (requested_sessions * requested_pipeline).clamp(DEFAULT_LARGE_INFLIGHT, 32)
     } else {
-        DEFAULT_SMALL_INFLIGHT.clamp(1, 8)
+        requested_pipeline.clamp(1, 8)
     };
 
     events
@@ -479,7 +514,8 @@ async fn download_job(
         })
         .await?;
 
-    client
+    client_pool
+        .first()
         .ensure_dc_authorized(job.dc_id, control, events)
         .await?;
 
@@ -510,8 +546,8 @@ async fn download_job(
     for _ in 0..inflight {
         let worker_job = job.clone();
         let worker_location = location.clone();
-        let worker_client = client.client.clone();
-        let worker_context = client.clone();
+        let worker_context = client_pool.get(workers.len()).clone();
+        let worker_client = worker_context.client.clone();
         let worker_control = control.clone();
         let worker_events = events.clone();
         let worker_file = Arc::clone(&file);
@@ -526,7 +562,7 @@ async fn download_job(
                 worker_location,
                 total_chunks,
                 worker_client,
-                &worker_context,
+                worker_context,
                 worker_control,
                 worker_events,
                 worker_file,
@@ -584,7 +620,7 @@ async fn worker_loop(
     mut location: tl::enums::InputFileLocation,
     total_chunks: u64,
     client: Client,
-    native_client: &NativeClientContext,
+    native_client: NativeClientContext,
     control: ControlState,
     events: EventWriter,
     file: Arc<Mutex<tokio::fs::File>>,
@@ -621,7 +657,7 @@ async fn worker_loop(
         progress.mark_inflight_start();
         let result = fetch_chunk(
             &client,
-            native_client,
+            &native_client,
             &mut job,
             &mut location,
             offset,
