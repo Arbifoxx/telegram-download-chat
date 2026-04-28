@@ -83,6 +83,7 @@ Thumbs.db
 *.tar.gz
 *.zip
 native/tdc-downloader/target/
+native/tdc-app/target/
 tdesktop
 
 # Version files

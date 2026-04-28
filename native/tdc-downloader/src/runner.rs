@@ -917,7 +917,6 @@ async fn monitor_progress(
         let mbps = (bytes_delta as f64 * 8.0) / elapsed / 1_000_000.0;
         let completed_parts = (bytes_delta / CHUNK_SIZE) as usize;
         let inflight_now = progress.inflight();
-        let allowed_now = progress.allowed_inflight();
         events
             .emit(&Event::FileProgress {
                 file_id: file_id.clone(),
@@ -928,7 +927,6 @@ async fn monitor_progress(
             })
             .await?;
         if bytes_delta == 0 && inflight_now > 0 {
-            progress.reduce_allowed_inflight();
             events
                 .emit(&Event::TransportStall {
                     file_id: file_id.clone(),
@@ -939,12 +937,6 @@ async fn monitor_progress(
                     stalled_ms: WINDOW_INTERVAL.as_millis() as u64,
                 })
                 .await?;
-        } else if bytes_delta > 0
-            && inflight_now >= allowed_now.saturating_sub(1)
-            && mbps >= 20.0
-            && completed_parts >= allowed_now.max(1) / 2
-        {
-            progress.increase_allowed_inflight();
         }
         events
             .emit(&Event::TransportWindow {
@@ -966,20 +958,17 @@ async fn monitor_progress(
 struct ProgressTracker {
     bytes_done: std::sync::atomic::AtomicU64,
     inflight: std::sync::atomic::AtomicUsize,
-    allowed_inflight: std::sync::atomic::AtomicUsize,
-    configured_inflight: usize,
+    max_inflight: usize,
     finished: std::sync::atomic::AtomicBool,
 }
 
 impl ProgressTracker {
     fn new(initial_bytes: u64, configured_inflight: usize) -> Self {
-        let configured_inflight = configured_inflight.max(1);
-        let initial_allowed = configured_inflight.min(8).max(2);
+        let max_inflight = configured_inflight.max(1);
         Self {
             bytes_done: std::sync::atomic::AtomicU64::new(initial_bytes),
             inflight: std::sync::atomic::AtomicUsize::new(0),
-            allowed_inflight: std::sync::atomic::AtomicUsize::new(initial_allowed),
-            configured_inflight,
+            max_inflight,
             finished: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1001,11 +990,7 @@ impl ProgressTracker {
             control.wait_if_paused().await;
 
             let current = self.inflight.load(std::sync::atomic::Ordering::Relaxed);
-            let allowed = self
-                .allowed_inflight
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .max(1);
-            if current < allowed {
+            if current < self.max_inflight {
                 if self
                     .inflight
                     .compare_exchange(
@@ -1031,34 +1016,6 @@ impl ProgressTracker {
 
     fn inflight(&self) -> usize {
         self.inflight.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn allowed_inflight(&self) -> usize {
-        self.allowed_inflight
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .max(1)
-    }
-
-    fn reduce_allowed_inflight(&self) {
-        let current = self.allowed_inflight();
-        let reduced = if current >= 8 {
-            current.saturating_sub(2)
-        } else {
-            current.saturating_sub(1)
-        }
-        .max(2);
-        self.allowed_inflight
-            .store(reduced, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn increase_allowed_inflight(&self) {
-        let current = self.allowed_inflight();
-        if current < self.configured_inflight {
-            self.allowed_inflight.store(
-                current + 1,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
     }
 
     fn mark_finished(&self) {

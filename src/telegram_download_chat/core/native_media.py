@@ -399,14 +399,17 @@ class NativeMediaBackend:
                 f"RUST_MEDIA_RUN_STARTED:{event.get('run_id', '')}:{event.get('file_count', 0)}"
             )
         elif event_type == "file_started":
-            # Don't surface a file into the GUI yet; wait until it reports
-            # real byte progress so the visible list reflects active work.
-            pass
+            filename = event.get("filename") or event.get("file_id", "")
+            total = int(event.get("expected_size") or 0)
+            if filename and filename not in self._ui_announced_files:
+                self._ui_announced_files.add(filename)
+                self.logger.info(f"MEDIA_DOWNLOADING:{filename}:{total}")
+                self.logger.info(f"MEDIA_FILE_PROGRESS:{filename}:0:{total}")
         elif event_type == "file_progress":
             filename = event.get("filename") or event.get("file_id", "")
             done = int(event.get("bytes_done") or 0)
             total = int(event.get("expected_size") or 0)
-            if filename and filename not in self._ui_announced_files and done > 0:
+            if filename and filename not in self._ui_announced_files:
                 self._ui_announced_files.add(filename)
                 self.logger.info(f"MEDIA_DOWNLOADING:{filename}:{total}")
             self.logger.info(f"MEDIA_FILE_PROGRESS:{filename}:{done}:{total}")
