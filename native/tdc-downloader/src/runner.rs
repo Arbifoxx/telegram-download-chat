@@ -362,6 +362,9 @@ async fn handle_start_run(
         .await?;
 
     let max_concurrent_downloads = start.settings.download_concurrency.clamp(1, 5);
+    let shared_client_pool = Arc::new(
+        NativeClientPool::from_auth_bundle(&start.auth_bundle, DEFAULT_LARGE_INFLIGHT.min(5)).await?
+    );
     let mut completed = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
@@ -401,8 +404,8 @@ async fn handle_start_run(
                     &mut active,
                     job.clone(),
                     state,
-                    start.auth_bundle.clone(),
                     start.settings.clone(),
+                    Arc::clone(&shared_client_pool),
                     control.clone(),
                     events.clone(),
                 );
@@ -430,8 +433,8 @@ async fn handle_start_run(
                     &mut active,
                     job.clone(),
                     state,
-                    start.auth_bundle.clone(),
                     start.settings.clone(),
+                    Arc::clone(&shared_client_pool),
                     control.clone(),
                     events.clone(),
                 );
@@ -452,6 +455,7 @@ async fn handle_start_run(
             failed,
         })
         .await?;
+    shared_client_pool.shutdown().await;
     Ok(())
 }
 
@@ -459,13 +463,13 @@ fn spawn_job(
     active: &mut tokio::task::JoinSet<Result<DownloadOutcome, RunnerError>>,
     job: DownloadJob,
     state: PartialState,
-    auth_bundle: AuthBundle,
     settings: crate::protocol::RunSettings,
+    client_pool: Arc<NativeClientPool>,
     control: ControlState,
     events: EventWriter,
 ) {
     active.spawn(async move {
-        download_job(job, state, &auth_bundle, &settings, &control, &events).await
+        download_job(job, state, &settings, client_pool, &control, &events).await
     });
 }
 
@@ -513,8 +517,8 @@ enum DownloadOutcome {
 async fn download_job(
     job: DownloadJob,
     state: PartialState,
-    auth_bundle: &AuthBundle,
-    _settings: &crate::protocol::RunSettings,
+    settings: &crate::protocol::RunSettings,
+    client_pool: Arc<NativeClientPool>,
     control: &ControlState,
     events: &EventWriter,
 ) -> Result<DownloadOutcome, RunnerError> {
@@ -529,23 +533,48 @@ async fn download_job(
         .await?;
     let medium = job.expected_size >= MEDIUM_FILE_THRESHOLD;
     let large = job.expected_size >= LARGE_FILE_THRESHOLD;
-    let requested_sessions = if large {
+    let requested_sessions = if settings.download_concurrency > 1 {
+        if large {
+            2
+        } else {
+            1
+        }
+    } else if large {
         5
     } else if medium {
         3
     } else {
         1
     };
-    let requested_pipeline = if large || medium { 4usize } else { 2usize };
-    let client_pool = NativeClientPool::from_auth_bundle(auth_bundle, requested_sessions).await?;
+    let requested_pipeline = if settings.download_concurrency > 1 {
+        if large { 4usize } else { 2usize }
+    } else if large || medium {
+        4usize
+    } else {
+        2usize
+    };
     let requested_sessions = requested_sessions.min(client_pool.len()).max(1);
     let inflight = if large {
-        (requested_sessions * requested_pipeline).clamp(DEFAULT_LARGE_INFLIGHT, 32)
+        (requested_sessions * requested_pipeline).clamp(
+            if settings.download_concurrency > 1 { 4 } else { DEFAULT_LARGE_INFLIGHT },
+            if settings.download_concurrency > 1 { 8 } else { 32 },
+        )
     } else if medium {
-        (requested_sessions * requested_pipeline).clamp(4, 12)
+        (requested_sessions * requested_pipeline).clamp(2, 6)
     } else {
-        requested_pipeline.clamp(1, 8)
+        requested_pipeline.clamp(1, 4)
     };
+
+    eprintln!(
+        "[tdc-downloader] start file={} dc={} size={} concurrent_files={} sessions={} pipeline={} inflight={}",
+        job.filename,
+        job.dc_id,
+        job.expected_size,
+        settings.download_concurrency,
+        requested_sessions,
+        requested_pipeline,
+        inflight
+    );
 
     events
         .emit(&Event::TransportPipeline {
@@ -644,16 +673,13 @@ async fn download_job(
     let _ = monitor.await;
 
     if control.is_stop_requested() {
-        client_pool.shutdown().await;
         return Ok(DownloadOutcome::Stopped);
     }
     if let Some(error) = first_error {
-        client_pool.shutdown().await;
         return Err(error);
     }
 
     finalize_job(&job).await?;
-    client_pool.shutdown().await;
     events
         .emit(&Event::FileCompleted {
             file_id: job.file_id.clone(),
@@ -815,9 +841,22 @@ async fn fetch_chunk(
             {
                 dc_id = error.value.unwrap() as i32;
                 job.dc_id = dc_id;
+                eprintln!(
+                    "[tdc-downloader] migrate file={} new_dc={} offset={}",
+                    job.filename, dc_id, offset
+                );
                 continue;
             }
-            Err(error) => return Err(RunnerError::Grammers(error.to_string())),
+            Err(error) => {
+                eprintln!(
+                    "[tdc-downloader] getfile error file={} dc={} offset={} error={}",
+                    job.filename,
+                    dc_id,
+                    offset,
+                    error
+                );
+                return Err(RunnerError::Grammers(error.to_string()));
+            }
         }
     }
 }
@@ -927,6 +966,13 @@ async fn monitor_progress(
             })
             .await?;
         if bytes_delta == 0 && inflight_now > 0 {
+            eprintln!(
+                "[tdc-downloader] stall file={} inflight={} progress={} total={}",
+                filename,
+                inflight_now,
+                current_bytes,
+                total
+            );
             events
                 .emit(&Event::TransportStall {
                     file_id: file_id.clone(),
@@ -938,6 +984,15 @@ async fn monitor_progress(
                 })
                 .await?;
         }
+        eprintln!(
+            "[tdc-downloader] window file={} inflight={} mbps={:.2} parts={} progress={} total={}",
+            filename,
+            inflight_now.min(configured_inflight),
+            mbps,
+            completed_parts,
+            current_bytes,
+            total
+        );
         events
             .emit(&Event::TransportWindow {
                 file_id: file_id.clone(),
