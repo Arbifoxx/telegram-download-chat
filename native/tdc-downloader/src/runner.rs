@@ -17,7 +17,6 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -520,6 +519,14 @@ async fn download_job(
     events: &EventWriter,
 ) -> Result<DownloadOutcome, RunnerError> {
     let location = parse_input_location(&job.location)?;
+    events
+        .emit(&Event::FileStarted {
+            file_id: job.file_id.clone(),
+            message_id: job.message_id.clone(),
+            filename: job.filename.clone(),
+            expected_size: job.expected_size,
+        })
+        .await?;
     let medium = job.expected_size >= MEDIUM_FILE_THRESHOLD;
     let large = job.expected_size >= LARGE_FILE_THRESHOLD;
     let requested_sessions = if large {
@@ -571,7 +578,6 @@ async fn download_job(
         bytes_done_from_state(&guard, job.expected_size)
     };
     let progress = Arc::new(ProgressTracker::new(initial_bytes, inflight));
-    let started_announced = Arc::new(AtomicBool::new(initial_bytes > 0));
 
     let monitor = tokio::spawn(monitor_progress(
         job.file_id.clone(),
@@ -597,7 +603,6 @@ async fn download_job(
         let worker_state = Arc::clone(&state_holder);
         let worker_next = Arc::clone(&next_chunk);
         let worker_progress = Arc::clone(&progress);
-        let worker_started = Arc::clone(&started_announced);
 
         workers.push(tokio::spawn(async move {
             worker_loop(
@@ -613,7 +618,6 @@ async fn download_job(
                 worker_state,
                 worker_next,
                 worker_progress,
-                worker_started,
             )
             .await
         }));
@@ -675,7 +679,6 @@ async fn worker_loop(
     state_holder: Arc<Mutex<PartialState>>,
     next_chunk: Arc<Mutex<u64>>,
     progress: Arc<ProgressTracker>,
-    started_announced: Arc<AtomicBool>,
 ) -> Result<(), RunnerError> {
     loop {
         control.wait_if_paused().await;
@@ -721,20 +724,6 @@ async fn worker_loop(
         };
         if bytes.is_empty() && control.is_stop_requested() {
             break;
-        }
-        if !bytes.is_empty()
-            && started_announced
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            events
-                .emit(&Event::FileStarted {
-                    file_id: job.file_id.clone(),
-                    message_id: job.message_id.clone(),
-                    filename: job.filename.clone(),
-                    expected_size: job.expected_size,
-                })
-                .await?;
         }
 
         {
