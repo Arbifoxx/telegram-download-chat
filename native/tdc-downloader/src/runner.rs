@@ -744,8 +744,8 @@ fn dc_permit_budget(concurrent_files: usize) -> usize {
         1 => 10,
         2 => 16,
         3 => 22,
-        4 => 30,
-        5 => 34,
+        4 => 29,
+        5 => 32,
         _ => 16,
     }
 }
