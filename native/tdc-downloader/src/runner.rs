@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -352,6 +352,40 @@ impl NativeClientPool {
     }
 }
 
+#[derive(Clone)]
+struct DcLimiter {
+    permits_by_dc: Arc<HashMap<i32, Arc<Semaphore>>>,
+}
+
+impl DcLimiter {
+    fn new(jobs: &[DownloadJob], max_concurrent_downloads: usize) -> Self {
+        let mut dc_ids = BTreeSet::new();
+        for job in jobs {
+            dc_ids.insert(job.dc_id);
+        }
+        let permits = dc_permit_budget(max_concurrent_downloads);
+        let permits_by_dc = dc_ids
+            .into_iter()
+            .map(|dc_id| (dc_id, Arc::new(Semaphore::new(permits))))
+            .collect::<HashMap<_, _>>();
+        Self {
+            permits_by_dc: Arc::new(permits_by_dc),
+        }
+    }
+
+    async fn acquire(&self, dc_id: i32) -> Result<Option<OwnedSemaphorePermit>, RunnerError> {
+        let Some(semaphore) = self.permits_by_dc.get(&dc_id) else {
+            return Ok(None);
+        };
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| RunnerError::Grammers(error.to_string()))?;
+        Ok(Some(permit))
+    }
+}
+
 async fn handle_start_run(
     start: StartRunCommand,
     control: ControlState,
@@ -365,6 +399,7 @@ async fn handle_start_run(
         .await?;
 
     let max_concurrent_downloads = start.settings.download_concurrency.clamp(1, 5);
+    let dc_limiter = DcLimiter::new(&start.jobs, max_concurrent_downloads);
     let shared_client_pool = Arc::new(
         NativeClientPool::from_auth_bundle(
             &start.auth_bundle,
@@ -413,6 +448,7 @@ async fn handle_start_run(
                     state,
                     start.settings.clone(),
                     Arc::clone(&shared_client_pool),
+                    dc_limiter.clone(),
                     control.clone(),
                     events.clone(),
                 );
@@ -442,6 +478,7 @@ async fn handle_start_run(
                     state,
                     start.settings.clone(),
                     Arc::clone(&shared_client_pool),
+                    dc_limiter.clone(),
                     control.clone(),
                     events.clone(),
                 );
@@ -472,11 +509,12 @@ fn spawn_job(
     state: PartialState,
     settings: crate::protocol::RunSettings,
     client_pool: Arc<NativeClientPool>,
+    dc_limiter: DcLimiter,
     control: ControlState,
     events: EventWriter,
 ) {
     active.spawn(async move {
-        download_job(job, state, &settings, client_pool, &control, &events).await
+        download_job(job, state, &settings, client_pool, dc_limiter, &control, &events).await
     });
 }
 
@@ -526,6 +564,7 @@ async fn download_job(
     state: PartialState,
     settings: &crate::protocol::RunSettings,
     client_pool: Arc<NativeClientPool>,
+    dc_limiter: DcLimiter,
     control: &ControlState,
     events: &EventWriter,
 ) -> Result<DownloadOutcome, RunnerError> {
@@ -611,6 +650,7 @@ async fn download_job(
         let worker_state = Arc::clone(&state_holder);
         let worker_next = Arc::clone(&next_chunk);
         let worker_progress = Arc::clone(&progress);
+        let worker_limiter = dc_limiter.clone();
 
         workers.push(tokio::spawn(async move {
             worker_loop(
@@ -619,6 +659,7 @@ async fn download_job(
                 total_chunks,
                 worker_client,
                 worker_context,
+                worker_limiter,
                 worker_control,
                 worker_events,
                 worker_file,
@@ -698,6 +739,17 @@ fn target_inflight_for_job(concurrent_files: usize, large: bool, medium: bool) -
     }
 }
 
+fn dc_permit_budget(concurrent_files: usize) -> usize {
+    match concurrent_files.clamp(1, 5) {
+        1 => 10,
+        2 => 16,
+        3 => 22,
+        4 => 26,
+        5 => 28,
+        _ => 16,
+    }
+}
+
 fn client_offset_for_job(job: &DownloadJob, pool_len: usize) -> usize {
     let pool_len = pool_len.max(1);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -712,6 +764,7 @@ async fn worker_loop(
     total_chunks: u64,
     client: Client,
     native_client: NativeClientContext,
+    dc_limiter: DcLimiter,
     control: ControlState,
     events: EventWriter,
     file: Arc<Mutex<tokio::fs::File>>,
@@ -749,6 +802,7 @@ async fn worker_loop(
         let result = fetch_chunk(
             &client,
             &native_client,
+            &dc_limiter,
             &mut job,
             &mut location,
             offset,
@@ -800,6 +854,7 @@ async fn worker_loop(
 async fn fetch_chunk(
     client: &Client,
     native_client: &NativeClientContext,
+    dc_limiter: &DcLimiter,
     job: &mut DownloadJob,
     location: &mut tl::enums::InputFileLocation,
     offset: u64,
@@ -824,6 +879,7 @@ async fn fetch_chunk(
             limit: CHUNK_SIZE as i32,
         };
 
+        let _permit = dc_limiter.acquire(dc_id).await?;
         match client.invoke_in_dc(dc_id, &request).await {
             Ok(tl::enums::upload::File::File(file)) => return Ok(file.bytes),
             Ok(tl::enums::upload::File::CdnRedirect(_)) => {
