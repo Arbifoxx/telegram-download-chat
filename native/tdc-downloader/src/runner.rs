@@ -29,7 +29,7 @@ const CHUNK_SIZE: u64 = 128 * 1024;
 const MEDIUM_FILE_THRESHOLD: u64 = 16 * 1024 * 1024;
 const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024;
 const DEFAULT_LARGE_INFLIGHT: usize = 8;
-const MAX_SHARED_CLIENTS: usize = 14;
+const MAX_SHARED_CLIENTS: usize = 18;
 const WINDOW_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const SLOT_WAIT_INTERVAL: Duration = Duration::from_millis(25);
@@ -355,6 +355,7 @@ impl NativeClientPool {
 #[derive(Clone)]
 struct DcLimiter {
     permits_by_dc: Arc<HashMap<i32, Arc<Semaphore>>>,
+    permits_per_dc: usize,
 }
 
 impl DcLimiter {
@@ -370,6 +371,7 @@ impl DcLimiter {
             .collect::<HashMap<_, _>>();
         Self {
             permits_by_dc: Arc::new(permits_by_dc),
+            permits_per_dc: permits,
         }
     }
 
@@ -383,6 +385,10 @@ impl DcLimiter {
             .await
             .map_err(|error| RunnerError::Grammers(error.to_string()))?;
         Ok(Some(permit))
+    }
+
+    fn permits_per_dc(&self) -> usize {
+        self.permits_per_dc
     }
 }
 
@@ -400,10 +406,18 @@ async fn handle_start_run(
 
     let max_concurrent_downloads = start.settings.download_concurrency.clamp(1, 5);
     let dc_limiter = DcLimiter::new(&start.jobs, max_concurrent_downloads);
+    let shared_client_count = (max_concurrent_downloads * 3).clamp(4, MAX_SHARED_CLIENTS);
+    debug_log(format!(
+        "run start: jobs={}, concurrent_files={}, shared_clients={}, dc_permits={}",
+        start.jobs.len(),
+        max_concurrent_downloads,
+        shared_client_count,
+        dc_limiter.permits_per_dc(),
+    ));
     let shared_client_pool = Arc::new(
         NativeClientPool::from_auth_bundle(
             &start.auth_bundle,
-            (max_concurrent_downloads * 2).clamp(4, MAX_SHARED_CLIENTS),
+            shared_client_count,
         )
         .await?
     );
@@ -593,6 +607,17 @@ async fn download_job(
     .max(1);
     let requested_pipeline = target_inflight.div_ceil(requested_sessions).max(1);
     let inflight = target_inflight;
+    debug_log(format!(
+        "job start: file_id={}, dc_id={}, size={}, inflight={}, sessions={}, pipeline={}, client_offset={}, pool={}",
+        job.file_id,
+        job.dc_id,
+        job.expected_size,
+        inflight,
+        requested_sessions,
+        requested_pipeline,
+        client_offset,
+        client_pool.len(),
+    ));
 
     events
         .emit(&Event::TransportPipeline {
@@ -1301,4 +1326,10 @@ fn update_dc_option(entry: &mut SessionDcOption, option: &DcOption) -> Result<()
         entry.ipv4 = SocketAddrV4::new(ipv4, option.port as u16);
     }
     Ok(())
+}
+
+fn debug_log(message: impl AsRef<str>) {
+    if std::env::var_os("TDC_DOWNLOADER_DEBUG").is_some() {
+        eprintln!("[tdc-downloader] {}", message.as_ref());
+    }
 }

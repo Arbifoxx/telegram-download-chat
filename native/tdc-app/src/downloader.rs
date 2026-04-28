@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
+use chrono::{DateTime, Local, SecondsFormat};
 use grammers_client::media::{Document, Downloadable, Media, Sticker};
+use grammers_client::peer::Peer;
 use grammers_client::Client;
+use grammers_session::types::{PeerKind, PeerRef};
 use grammers_session::storages::SqliteSession;
 use grammers_session::Session;
 use grammers_tl_types as tl;
@@ -16,6 +19,7 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use crate::config::{ActiveDownload, DownloadMode};
+use crate::export::render_native_exports;
 use crate::telegram;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -29,6 +33,8 @@ pub struct TelegramDownloadParams {
     pub overwrite_existing: bool,
     pub concurrent_downloads: u8,
     pub sort_descending: bool,
+    pub html_export: bool,
+    pub pdf_export: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -64,6 +70,13 @@ struct RuntimeFile {
     filename: String,
     bytes_done: u64,
     expected_size: u64,
+}
+
+#[derive(Debug, Default)]
+struct ScanResults {
+    jobs: Vec<Value>,
+    contexts: Vec<JobContext>,
+    export_messages: Vec<Value>,
 }
 
 impl DownloadController {
@@ -147,33 +160,62 @@ async fn run_telegram_download(
     }
 
     set_status(&snapshot, "Resolving chat...");
-    let peer_ref = resolve_peer_ref(&client, &params.chat_input).await?;
+    let (peer, peer_ref) = resolve_peer(&client, &params.chat_input).await?;
+    let chat_title = peer_display_name(&peer);
     let output_root = PathBuf::from(params.output_path.trim());
+    let output_json_path = output_root.join("output.json");
+    let output_txt_path = output_root.join("output.txt");
+    let output_html_path = output_root.join("output.html");
+    let output_pdf_path = output_root.join("output.pdf");
     let attachments_dir = output_root.join("attachments");
     tokio::fs::create_dir_all(&attachments_dir)
         .await
         .map_err(|error| format!("Failed to create output directory: {error}"))?;
 
     set_status(&snapshot, "Scanning chat media...");
-    let (mut jobs, contexts) =
-        build_jobs(&client, peer_ref, &attachments_dir, &params, Arc::clone(&snapshot)).await?;
-    if jobs.is_empty() {
+    let self_display_name = me.full_name();
+    let mut scan = build_jobs(
+        &client,
+        peer_ref,
+        &attachments_dir,
+        &params,
+        self_display_name.as_str(),
+        Arc::clone(&snapshot),
+    )
+    .await?;
+    if !params.sort_descending {
+        scan.jobs.reverse();
+        scan.export_messages.reverse();
+    }
+    write_message_exports(&scan.export_messages, &output_json_path, &output_txt_path).await?;
+    if scan.jobs.is_empty() {
+        finalize_attachment_paths(&mut scan.export_messages, &attachments_dir);
+        write_message_exports(&scan.export_messages, &output_json_path, &output_txt_path).await?;
+        if params.html_export || params.pdf_export {
+            render_native_exports(
+                &scan.export_messages,
+                &attachments_dir,
+                &chat_title,
+                params.html_export.then_some(output_html_path.as_path()),
+                params.pdf_export.then_some(output_pdf_path.as_path()),
+            )
+            .await?;
+        }
         let mut state = snapshot.lock().unwrap();
-        state.status_message = "No downloadable media found in this chat.".to_string();
+        state.status_message = "Saved messages. No downloadable media found in this chat.".to_string();
         state.mode = DownloadMode::Stopped;
         state.finished = true;
         return Ok(());
     }
-    if !params.sort_descending {
-        jobs.reverse();
-    }
-    let contexts_by_file_id = contexts
+    let contexts_by_file_id = scan
+        .contexts
         .into_iter()
         .map(|context| (context.file_id.clone(), context))
         .collect::<HashMap<_, _>>();
 
     set_status(&snapshot, "Preparing download transport...");
-    let auth_bundle = build_auth_bundle(&client, api_id, &params.api_hash, &jobs, me.full_name()).await?;
+    let auth_bundle =
+        build_auth_bundle(&client, api_id, &params.api_hash, &scan.jobs, me.full_name()).await?;
     let binary = locate_native_downloader_binary()
         .ok_or_else(|| "Rust downloader backend binary was not found.".to_string())?;
 
@@ -222,7 +264,7 @@ async fn run_telegram_download(
             "download_concurrency": params.concurrent_downloads.clamp(1, 5),
         },
         "auth_bundle": auth_bundle,
-        "jobs": jobs,
+        "jobs": scan.jobs,
     });
     send_command(&mut stdin, &start_command).await?;
     set_status(&snapshot, "Downloading media...");
@@ -307,6 +349,19 @@ async fn run_telegram_download(
             current
         }
     };
+
+    finalize_attachment_paths(&mut scan.export_messages, &attachments_dir);
+    write_message_exports(&scan.export_messages, &output_json_path, &output_txt_path).await?;
+    if params.html_export || params.pdf_export {
+        render_native_exports(
+            &scan.export_messages,
+            &attachments_dir,
+            &chat_title,
+            params.html_export.then_some(output_html_path.as_path()),
+            params.pdf_export.then_some(output_pdf_path.as_path()),
+        )
+        .await?;
+    }
 
     let mut state = snapshot.lock().unwrap();
     state.status_message = status;
@@ -462,13 +517,13 @@ async fn handle_event(
 
 async fn build_jobs(
     client: &Client,
-    peer_ref: grammers_session::types::PeerRef,
+    peer_ref: PeerRef,
     attachments_dir: &Path,
     params: &TelegramDownloadParams,
+    self_display_name: &str,
     snapshot: Arc<Mutex<DownloadSnapshot>>,
-) -> Result<(Vec<Value>, Vec<JobContext>), String> {
-    let mut jobs = Vec::new();
-    let mut contexts = Vec::new();
+) -> Result<ScanResults, String> {
+    let mut scan = ScanResults::default();
     let mut messages = client.iter_messages(peer_ref);
     let mut scanned = 0usize;
 
@@ -481,42 +536,51 @@ async fn build_jobs(
         if scanned % 250 == 0 {
             set_status(&snapshot, &format!("Scanning media... {scanned} messages"));
         }
-        let Some(media) = message.media() else {
-            continue;
-        };
-        let Some(location) = media.to_raw_input_location() else {
-            continue;
-        };
-        let filename = media_filename(&media, message.id());
-        let final_path = attachments_dir.join(&filename);
-        let state_path = final_path.with_file_name(format!("{filename}.part.state.json"));
-        let temp_path = final_path.with_file_name(format!("{filename}.part"));
-        let file_id = format!("{}:{filename}", message.id());
+        let media = message.media();
+        let mut predicted_attachment_path = None;
 
-        jobs.push(json!({
-            "file_id": file_id,
-            "message_id": message.id().to_string(),
-            "filename": filename,
-            "category": "attachments",
-            "final_path": final_path.to_string_lossy().to_string(),
-            "temp_path": temp_path.to_string_lossy().to_string(),
-            "state_path": state_path.to_string_lossy().to_string(),
-            "expected_size": media_expected_size(&media),
-            "overwrite": params.overwrite_existing,
-            "skip_if_complete": !params.overwrite_existing,
-            "resume_if_partial": !params.overwrite_existing,
-            "dc_id": media_dc_id(&media),
-            "location": location_to_json(&location)?,
-            "media_type": media_type_name(&media),
-            "input_chat": Value::Null,
-        }));
-        contexts.push(JobContext {
-            file_id,
-            message_id: message.id(),
-        });
+        if let Some(media) = media.as_ref() {
+            if let Some(location) = media.to_raw_input_location() {
+                let filename = media_filename(media, message.id());
+                let final_path = attachments_dir.join(&filename);
+                let state_path = final_path.with_file_name(format!("{filename}.part.state.json"));
+                let temp_path = final_path.with_file_name(format!("{filename}.part"));
+                let file_id = format!("{}:{filename}", message.id());
+
+                scan.jobs.push(json!({
+                    "file_id": file_id,
+                    "message_id": message.id().to_string(),
+                    "filename": filename,
+                    "category": "attachments",
+                    "final_path": final_path.to_string_lossy().to_string(),
+                    "temp_path": temp_path.to_string_lossy().to_string(),
+                    "state_path": state_path.to_string_lossy().to_string(),
+                    "expected_size": media_expected_size(media),
+                    "overwrite": params.overwrite_existing,
+                    "skip_if_complete": !params.overwrite_existing,
+                    "resume_if_partial": !params.overwrite_existing,
+                    "dc_id": media_dc_id(media),
+                    "location": location_to_json(&location)?,
+                    "media_type": media_type_name(media),
+                    "input_chat": Value::Null,
+                }));
+                scan.contexts.push(JobContext {
+                    file_id,
+                    message_id: message.id(),
+                });
+                predicted_attachment_path = Some(filename);
+            }
+        }
+
+        scan.export_messages.push(export_message_json(
+            &message,
+            media.as_ref(),
+            predicted_attachment_path.as_deref(),
+            self_display_name,
+        ));
     }
 
-    Ok((jobs, contexts))
+    Ok(scan)
 }
 
 async fn build_auth_bundle(
@@ -588,6 +652,161 @@ async fn build_exported_auth(
     Ok(Value::Object(map))
 }
 
+async fn write_message_exports(
+    messages: &[Value],
+    json_path: &Path,
+    txt_path: &Path,
+) -> Result<(), String> {
+    let json_payload = serde_json::to_vec_pretty(messages)
+        .map_err(|error| format!("Failed to serialize message export: {error}"))?;
+    tokio::fs::write(json_path, json_payload)
+        .await
+        .map_err(|error| format!("Failed to write {}: {error}", json_path.display()))?;
+
+    let txt_payload = format_messages_as_txt(messages);
+    tokio::fs::write(txt_path, txt_payload)
+        .await
+        .map_err(|error| format!("Failed to write {}: {error}", txt_path.display()))?;
+    Ok(())
+}
+
+fn format_messages_as_txt(messages: &[Value]) -> String {
+    let mut output = String::new();
+    for message in messages {
+        let date = message
+            .get("date")
+            .and_then(Value::as_str)
+            .and_then(format_export_datetime)
+            .unwrap_or_default();
+        let sender = message
+            .get("user_display_name")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown");
+        let mut text = message
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        if text.trim().is_empty() {
+            if let Some(service_text) = service_text_from_export_message(message) {
+                text = service_text;
+            } else if let Some(placeholder) = media_placeholder_from_export_message(message) {
+                text = placeholder;
+            }
+        } else if let Some(placeholder) = media_placeholder_from_export_message(message) {
+            text.push('\n');
+            text.push_str(&placeholder);
+        }
+
+        if !date.is_empty() || !sender.is_empty() {
+            output.push_str(&format!("{date} {sender}:\n{text}\n\n"));
+        } else {
+            output.push_str(&format!("{text}\n\n"));
+        }
+    }
+    output
+}
+
+fn format_export_datetime(raw: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|date| date.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+fn service_text_from_export_message(message: &Value) -> Option<String> {
+    let action = message.get("action")?.as_object()?;
+    let action_name = action.get("_")?.as_str()?;
+    let sender = message
+        .get("user_display_name")
+        .and_then(Value::as_str)
+        .unwrap_or("Someone");
+    let label = match action_name {
+        "MessageActionChatAddUser" => "joined the group",
+        "MessageActionChatDeleteUser" => "left the group",
+        "MessageActionChatJoinedByLink" => "joined via invite link",
+        "MessageActionChatEditTitle" => {
+            if let Some(title) = action.get("title").and_then(Value::as_str) {
+                return Some(format!("{sender} changed the group name to \"{title}\""));
+            }
+            "changed the group name"
+        }
+        "MessageActionChatEditPhoto" => "updated the group photo",
+        "MessageActionChatCreate" => "created the group",
+        "MessageActionPinMessage" => "pinned a message",
+        "MessageActionChatMigrateTo" => "group was upgraded to a supergroup",
+        "MessageActionChannelCreate" => "created the channel",
+        "MessageActionPhoneCall" => "Phone call",
+        "MessageActionGroupCall" => "Group call",
+        "MessageActionInviteToGroupCall" => "was invited to a voice chat",
+        "MessageActionContactSignUp" => "joined Telegram",
+        "MessageActionHistoryClear" => "cleared the history",
+        "MessageActionSetMessagesTTL" => "changed the auto-delete timer",
+        "MessageActionScreenshotTaken" => "took a screenshot",
+        _ => return None,
+    };
+    Some(format!("{sender} {label}"))
+}
+
+fn media_placeholder_from_export_message(message: &Value) -> Option<String> {
+    let media = message.get("media")?.as_object()?;
+    let media_type = media.get("_")?.as_str()?;
+    match media_type {
+        "MessageMediaPhoto" => Some("[photo]".to_string()),
+        "MessageMediaDocument" => {
+            let filename = message
+                .get("attachment_path")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .or_else(|| {
+                    media.get("document")
+                        .and_then(Value::as_object)
+                        .and_then(|document| document.get("attributes"))
+                        .and_then(Value::as_array)
+                        .and_then(|attrs| {
+                            attrs.iter().find_map(|attr| {
+                                let attr = attr.as_object()?;
+                                if attr.get("_").and_then(Value::as_str)
+                                    == Some("DocumentAttributeFilename")
+                                {
+                                    attr.get("file_name").and_then(Value::as_str)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                })
+                .unwrap_or("attachment");
+            Some(format!("[file={filename}]"))
+        }
+        "MessageMediaContact" => Some("[contact]".to_string()),
+        "MessageMediaGeo" | "MessageMediaGeoLive" | "MessageMediaVenue" => {
+            Some("[location]".to_string())
+        }
+        "MessageMediaPoll" => Some("[poll]".to_string()),
+        _ => Some("[media]".to_string()),
+    }
+}
+
+fn finalize_attachment_paths(messages: &mut [Value], attachments_dir: &Path) {
+    for message in messages {
+        let Some(attachment_path) = message
+            .get("attachment_path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !attachments_dir.join(&attachment_path).exists() {
+            if let Some(object) = message.as_object_mut() {
+                object.insert("attachment_path".to_string(), Value::Null);
+            }
+        }
+    }
+}
+
 fn session_dc_options(session: &SqliteSession) -> Vec<Value> {
     let mut results = Vec::new();
     for dc_id in 1..=10 {
@@ -618,10 +837,158 @@ fn session_dc_options(session: &SqliteSession) -> Vec<Value> {
     results
 }
 
-async fn resolve_peer_ref(
-    client: &Client,
-    raw_input: &str,
-) -> Result<grammers_session::types::PeerRef, String> {
+fn export_message_json(
+    message: &grammers_client::message::Message,
+    media: Option<&Media>,
+    attachment_path: Option<&str>,
+    self_display_name: &str,
+) -> Value {
+    json!({
+        "id": message.id(),
+        "date": message.date().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "out": message.outgoing(),
+        "from_id": export_from_id_json(message),
+        "user_display_name": export_sender_name(message, self_display_name),
+        "message": message.text(),
+        "edit_date": message.edit_date().map(|date| date.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        "action": export_action_json(message),
+        "media": media.map(export_media_json),
+        "attachment_path": attachment_path,
+        "fwd_from": export_forward_json(message),
+        "reply_to": export_reply_json(message),
+    })
+}
+
+fn export_from_id_json(message: &grammers_client::message::Message) -> Value {
+    let Some(sender_id) = message.sender_id() else {
+        return Value::Null;
+    };
+    match sender_id.kind() {
+        PeerKind::User | PeerKind::UserSelf => json!({"user_id": sender_id.bare_id()}),
+        PeerKind::Chat => json!({"chat_id": sender_id.bare_id()}),
+        PeerKind::Channel => json!({"channel_id": sender_id.bare_id()}),
+    }
+}
+
+fn export_sender_name(message: &grammers_client::message::Message, self_display_name: &str) -> String {
+    if let Some(sender) = message.sender() {
+        return peer_display_name(sender);
+    }
+    if message.outgoing() && !self_display_name.is_empty() {
+        return self_display_name.to_string();
+    }
+    "Unknown".to_string()
+}
+
+fn export_action_json(message: &grammers_client::message::Message) -> Option<Value> {
+    match message.action()? {
+        tl::enums::MessageAction::ChatAddUser(_) => Some(json!({"_": "MessageActionChatAddUser"})),
+        tl::enums::MessageAction::ChatDeleteUser(_) => Some(json!({"_": "MessageActionChatDeleteUser"})),
+        tl::enums::MessageAction::ChatJoinedByLink(_) => Some(json!({"_": "MessageActionChatJoinedByLink"})),
+        tl::enums::MessageAction::ChatEditPhoto(_) => Some(json!({"_": "MessageActionChatEditPhoto"})),
+        tl::enums::MessageAction::ChatCreate(_) => Some(json!({"_": "MessageActionChatCreate"})),
+        tl::enums::MessageAction::PinMessage => Some(json!({"_": "MessageActionPinMessage"})),
+        tl::enums::MessageAction::ChatMigrateTo(_) => Some(json!({"_": "MessageActionChatMigrateTo"})),
+        tl::enums::MessageAction::ChannelCreate(_) => Some(json!({"_": "MessageActionChannelCreate"})),
+        tl::enums::MessageAction::PhoneCall(_) => Some(json!({"_": "MessageActionPhoneCall"})),
+        tl::enums::MessageAction::GroupCall(_) => Some(json!({"_": "MessageActionGroupCall"})),
+        tl::enums::MessageAction::InviteToGroupCall(_) => {
+            Some(json!({"_": "MessageActionInviteToGroupCall"}))
+        }
+        tl::enums::MessageAction::ContactSignUp => Some(json!({"_": "MessageActionContactSignUp"})),
+        tl::enums::MessageAction::HistoryClear => Some(json!({"_": "MessageActionHistoryClear"})),
+        tl::enums::MessageAction::SetMessagesTtl(_) => Some(json!({"_": "MessageActionSetMessagesTTL"})),
+        tl::enums::MessageAction::ScreenshotTaken => Some(json!({"_": "MessageActionScreenshotTaken"})),
+        tl::enums::MessageAction::ChatEditTitle(action) => Some(json!({
+            "_": "MessageActionChatEditTitle",
+            "title": action.title,
+        })),
+        _ => None,
+    }
+}
+
+fn export_forward_json(message: &grammers_client::message::Message) -> Option<Value> {
+    let header = message.forward_header()?;
+    match header {
+        tl::enums::MessageFwdHeader::Header(header) => Some(json!({
+            "from_name": header.from_name,
+        })),
+    }
+}
+
+fn export_reply_json(message: &grammers_client::message::Message) -> Option<Value> {
+    let header = message.reply_header()?;
+    match header {
+        tl::enums::MessageReplyHeader::Header(header) => Some(json!({
+            "quote_text": header.quote_text,
+        })),
+        _ => None,
+    }
+}
+
+fn export_media_json(media: &Media) -> Value {
+    match media {
+        Media::Photo(_) => json!({"_": "MessageMediaPhoto"}),
+        Media::Document(document) => json!({
+            "_": "MessageMediaDocument",
+            "document": {
+                "size": document.size(),
+                "attributes": export_document_attributes(document),
+            }
+        }),
+        Media::Sticker(sticker) => json!({
+            "_": "MessageMediaDocument",
+            "document": {
+                "size": sticker.document.size(),
+                "attributes": export_sticker_attributes(sticker),
+            }
+        }),
+        Media::Contact(_) => json!({"_": "MessageMediaContact"}),
+        Media::Poll(_) => json!({"_": "MessageMediaPoll"}),
+        Media::Geo(_) => json!({"_": "MessageMediaGeo"}),
+        Media::GeoLive(_) => json!({"_": "MessageMediaGeoLive"}),
+        Media::Venue(_) => json!({"_": "MessageMediaVenue"}),
+        _ => json!({"_": "MessageMediaUnsupported"}),
+    }
+}
+
+fn export_document_attributes(document: &Document) -> Vec<Value> {
+    let mut attributes = Vec::new();
+    if let Some(filename) = document.name() {
+        attributes.push(json!({
+            "_": "DocumentAttributeFilename",
+            "file_name": filename,
+        }));
+    }
+    if document
+        .mime_type()
+        .map(|mime| mime.starts_with("video/"))
+        .unwrap_or(false)
+    {
+        attributes.push(json!({"_": "DocumentAttributeVideo"}));
+    }
+    if document
+        .mime_type()
+        .map(|mime| mime.starts_with("audio/"))
+        .unwrap_or(false)
+    {
+        attributes.push(json!({"_": "DocumentAttributeAudio"}));
+    }
+    attributes
+}
+
+fn export_sticker_attributes(sticker: &Sticker) -> Vec<Value> {
+    let mut attributes = export_document_attributes(&sticker.document);
+    if !attributes
+        .iter()
+        .any(|attr| attr.get("_").and_then(Value::as_str) == Some("DocumentAttributeSticker"))
+    {
+        attributes.push(json!({"_": "DocumentAttributeSticker"}));
+    }
+    attributes
+}
+
+async fn resolve_peer(client: &Client, raw_input: &str) -> Result<(Peer, PeerRef), String> {
     let normalized = raw_input
         .trim()
         .trim_start_matches('@')
@@ -635,9 +1002,26 @@ async fn resolve_peer_ref(
         .await
         .map_err(|error| format!("Failed to resolve Telegram chat: {error}"))?
         .ok_or_else(|| "Telegram chat could not be resolved.".to_string())?;
-    peer.to_ref()
+    let peer_ref = peer
+        .to_ref()
         .await
-        .ok_or_else(|| "Telegram chat reference could not be created.".to_string())
+        .ok_or_else(|| "Telegram chat reference could not be created.".to_string())?;
+    Ok((peer, peer_ref))
+}
+
+fn peer_display_name(peer: &Peer) -> String {
+    match peer {
+        Peer::User(user) => {
+            let full_name = user.full_name();
+            if full_name.is_empty() {
+                user.username().unwrap_or("Unknown").to_string()
+            } else {
+                full_name
+            }
+        }
+        Peer::Group(group) => group.title().unwrap_or("Chat").to_string(),
+        Peer::Channel(channel) => channel.title().to_string(),
+    }
 }
 
 fn media_filename(media: &Media, message_id: i32) -> String {

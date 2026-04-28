@@ -1,5 +1,6 @@
 mod config;
 mod downloader;
+mod export;
 mod telegram;
 
 use config::{
@@ -412,6 +413,8 @@ impl Application for TdcApp {
                             overwrite_existing: self.config.overwrite_existing,
                             concurrent_downloads: self.config.concurrent_downloads,
                             sort_descending: self.config.sort_descending,
+                            html_export: self.config.html_export,
+                            pdf_export: self.config.pdf_export,
                         }),
                         Message::TelegramDownloadStarted,
                     );
