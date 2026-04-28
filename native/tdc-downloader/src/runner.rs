@@ -533,37 +533,13 @@ async fn download_job(
         .await?;
     let medium = job.expected_size >= MEDIUM_FILE_THRESHOLD;
     let large = job.expected_size >= LARGE_FILE_THRESHOLD;
-    let requested_sessions = if settings.download_concurrency > 1 {
-        if large {
-            2
-        } else {
-            1
-        }
-    } else if large {
-        5
-    } else if medium {
-        3
-    } else {
-        1
-    };
-    let requested_pipeline = if settings.download_concurrency > 1 {
-        if large { 4usize } else { 2usize }
-    } else if large || medium {
-        4usize
-    } else {
-        2usize
-    };
-    let requested_sessions = requested_sessions.min(client_pool.len()).max(1);
-    let inflight = if large {
-        (requested_sessions * requested_pipeline).clamp(
-            if settings.download_concurrency > 1 { 4 } else { DEFAULT_LARGE_INFLIGHT },
-            if settings.download_concurrency > 1 { 8 } else { 32 },
-        )
-    } else if medium {
-        (requested_sessions * requested_pipeline).clamp(2, 6)
-    } else {
-        requested_pipeline.clamp(1, 4)
-    };
+    let concurrent_files = settings.download_concurrency.clamp(1, 5);
+    let target_inflight = target_inflight_for_job(concurrent_files, large, medium);
+    let requested_sessions = if target_inflight > 4 { 2 } else { 1 }
+        .min(client_pool.len())
+        .max(1);
+    let requested_pipeline = target_inflight.div_ceil(requested_sessions).max(1);
+    let inflight = target_inflight;
 
     eprintln!(
         "[tdc-downloader] start file={} dc={} size={} concurrent_files={} sessions={} pipeline={} inflight={}",
@@ -689,6 +665,27 @@ async fn download_job(
         })
         .await?;
     Ok(DownloadOutcome::Completed)
+}
+
+fn target_inflight_for_job(concurrent_files: usize, large: bool, medium: bool) -> usize {
+    match (concurrent_files.clamp(1, 5), large, medium) {
+        (1, true, _) => 8,
+        (1, _, true) => 6,
+        (1, _, false) => 2,
+        (2, true, _) => 8,
+        (2, _, true) => 4,
+        (2, _, false) => 2,
+        (3, true, _) => 7,
+        (3, _, true) => 4,
+        (3, _, false) => 2,
+        (4, true, _) => 6,
+        (4, _, true) => 3,
+        (4, _, false) => 2,
+        (5, true, _) => 5,
+        (5, _, true) => 3,
+        (5, _, false) => 2,
+        _ => 2,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

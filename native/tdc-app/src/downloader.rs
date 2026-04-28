@@ -206,6 +206,7 @@ async fn run_telegram_download(
             if trimmed.is_empty() {
                 continue;
             }
+            eprintln!("[tdc-downloader] {trimmed}");
             let mut tail = stderr_tail_reader.lock().await;
             if tail.len() == 24 {
                 tail.pop_front();
