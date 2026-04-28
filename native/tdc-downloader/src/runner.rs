@@ -29,6 +29,7 @@ const CHUNK_SIZE: u64 = 128 * 1024;
 const MEDIUM_FILE_THRESHOLD: u64 = 16 * 1024 * 1024;
 const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024;
 const DEFAULT_LARGE_INFLIGHT: usize = 8;
+const MAX_SHARED_CLIENTS: usize = 10;
 const WINDOW_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const SLOT_WAIT_INTERVAL: Duration = Duration::from_millis(25);
@@ -367,7 +368,7 @@ async fn handle_start_run(
     let shared_client_pool = Arc::new(
         NativeClientPool::from_auth_bundle(
             &start.auth_bundle,
-            (max_concurrent_downloads * 2).clamp(4, DEFAULT_LARGE_INFLIGHT),
+            (max_concurrent_downloads * 2).clamp(4, MAX_SHARED_CLIENTS),
         )
         .await?
     );
@@ -542,9 +543,15 @@ async fn download_job(
     let concurrent_files = settings.download_concurrency.clamp(1, 5);
     let target_inflight = target_inflight_for_job(concurrent_files, large, medium);
     let client_offset = client_offset_for_job(&job, client_pool.len());
-    let requested_sessions = if target_inflight > 4 { 2 } else { 1 }
-        .min(client_pool.len())
-        .max(1);
+    let requested_sessions = if target_inflight >= 7 {
+        3
+    } else if target_inflight >= 4 {
+        2
+    } else {
+        1
+    }
+    .min(client_pool.len())
+    .max(1);
     let requested_pipeline = target_inflight.div_ceil(requested_sessions).max(1);
     let inflight = target_inflight;
 
@@ -672,20 +679,20 @@ async fn download_job(
 
 fn target_inflight_for_job(concurrent_files: usize, large: bool, medium: bool) -> usize {
     match (concurrent_files.clamp(1, 5), large, medium) {
-        (1, true, _) => 8,
+        (1, true, _) => 9,
         (1, _, true) => 6,
         (1, _, false) => 2,
         (2, true, _) => 8,
-        (2, _, true) => 4,
+        (2, _, true) => 5,
         (2, _, false) => 2,
-        (3, true, _) => 7,
-        (3, _, true) => 4,
+        (3, true, _) => 8,
+        (3, _, true) => 5,
         (3, _, false) => 2,
-        (4, true, _) => 6,
-        (4, _, true) => 3,
+        (4, true, _) => 7,
+        (4, _, true) => 4,
         (4, _, false) => 2,
-        (5, true, _) => 6,
-        (5, _, true) => 4,
+        (5, true, _) => 7,
+        (5, _, true) => 5,
         (5, _, false) => 2,
         _ => 2,
     }
