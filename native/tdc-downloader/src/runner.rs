@@ -29,7 +29,7 @@ const CHUNK_SIZE: u64 = 128 * 1024;
 const MEDIUM_FILE_THRESHOLD: u64 = 16 * 1024 * 1024;
 const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024;
 const DEFAULT_LARGE_INFLIGHT: usize = 8;
-const MAX_SHARED_CLIENTS: usize = 10;
+const MAX_SHARED_CLIENTS: usize = 12;
 const WINDOW_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const SLOT_WAIT_INTERVAL: Duration = Duration::from_millis(25);
@@ -744,8 +744,8 @@ fn dc_permit_budget(concurrent_files: usize) -> usize {
         1 => 10,
         2 => 16,
         3 => 22,
-        4 => 26,
-        5 => 28,
+        4 => 27,
+        5 => 30,
         _ => 16,
     }
 }
