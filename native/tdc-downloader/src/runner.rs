@@ -13,6 +13,7 @@ use grammers_session::SessionData;
 use grammers_tl_types as tl;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ const DEFAULT_LARGE_INFLIGHT: usize = 8;
 const WINDOW_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const SLOT_WAIT_INTERVAL: Duration = Duration::from_millis(25);
+const STATE_SAVE_INTERVAL_CHUNKS: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -363,7 +365,11 @@ async fn handle_start_run(
 
     let max_concurrent_downloads = start.settings.download_concurrency.clamp(1, 5);
     let shared_client_pool = Arc::new(
-        NativeClientPool::from_auth_bundle(&start.auth_bundle, DEFAULT_LARGE_INFLIGHT.min(5)).await?
+        NativeClientPool::from_auth_bundle(
+            &start.auth_bundle,
+            (max_concurrent_downloads * 2).clamp(4, DEFAULT_LARGE_INFLIGHT),
+        )
+        .await?
     );
     let mut completed = 0usize;
     let mut skipped = 0usize;
@@ -535,22 +541,12 @@ async fn download_job(
     let large = job.expected_size >= LARGE_FILE_THRESHOLD;
     let concurrent_files = settings.download_concurrency.clamp(1, 5);
     let target_inflight = target_inflight_for_job(concurrent_files, large, medium);
+    let client_offset = client_offset_for_job(&job, client_pool.len());
     let requested_sessions = if target_inflight > 4 { 2 } else { 1 }
         .min(client_pool.len())
         .max(1);
     let requested_pipeline = target_inflight.div_ceil(requested_sessions).max(1);
     let inflight = target_inflight;
-
-    eprintln!(
-        "[tdc-downloader] start file={} dc={} size={} concurrent_files={} sessions={} pipeline={} inflight={}",
-        job.filename,
-        job.dc_id,
-        job.expected_size,
-        settings.download_concurrency,
-        requested_sessions,
-        requested_pipeline,
-        inflight
-    );
 
     events
         .emit(&Event::TransportPipeline {
@@ -567,7 +563,7 @@ async fn download_job(
 
     for session_index in 0..requested_sessions {
         client_pool
-            .get(session_index)
+            .get(client_offset + session_index)
             .ensure_dc_authorized(job.dc_id, control, events)
             .await?;
     }
@@ -599,7 +595,7 @@ async fn download_job(
     for _ in 0..inflight {
         let worker_job = job.clone();
         let worker_location = location.clone();
-        let worker_context = client_pool.get(workers.len()).clone();
+        let worker_context = client_pool.get(client_offset + workers.len()).clone();
         let worker_client = worker_context.client.clone();
         let worker_control = control.clone();
         let worker_events = events.clone();
@@ -648,6 +644,13 @@ async fn download_job(
     progress.mark_finished();
     let _ = monitor.await;
 
+    {
+        let state = state_holder.lock().await;
+        state
+            .save(Path::new(&job.state_path))
+            .map_err(RunnerError::from)?;
+    }
+
     if control.is_stop_requested() {
         return Ok(DownloadOutcome::Stopped);
     }
@@ -681,11 +684,18 @@ fn target_inflight_for_job(concurrent_files: usize, large: bool, medium: bool) -
         (4, true, _) => 6,
         (4, _, true) => 3,
         (4, _, false) => 2,
-        (5, true, _) => 5,
-        (5, _, true) => 3,
+        (5, true, _) => 6,
+        (5, _, true) => 4,
         (5, _, false) => 2,
         _ => 2,
     }
+}
+
+fn client_offset_for_job(job: &DownloadJob, pool_len: usize) -> usize {
+    let pool_len = pool_len.max(1);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    job.file_id.hash(&mut hasher);
+    (hasher.finish() as usize) % pool_len
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -754,7 +764,6 @@ async fn worker_loop(
             use tokio::io::{AsyncSeekExt, AsyncWriteExt};
             temp.seek(std::io::SeekFrom::Start(offset)).await?;
             temp.write_all(&bytes).await?;
-            temp.flush().await?;
         }
 
         {
@@ -765,7 +774,11 @@ async fn worker_loop(
             let mut state = state_holder.lock().await;
             state.mark_chunk_complete(offset);
             state.dc_id = job.dc_id;
-            state.save(Path::new(&job.state_path))?;
+            if state.completed_chunks.len() % STATE_SAVE_INTERVAL_CHUNKS == 0
+                || bytes.len() < CHUNK_SIZE as usize
+            {
+                state.save(Path::new(&job.state_path))?;
+            }
         }
         progress.mark_bytes(bytes.len() as u64);
 
@@ -838,22 +851,9 @@ async fn fetch_chunk(
             {
                 dc_id = error.value.unwrap() as i32;
                 job.dc_id = dc_id;
-                eprintln!(
-                    "[tdc-downloader] migrate file={} new_dc={} offset={}",
-                    job.filename, dc_id, offset
-                );
                 continue;
             }
-            Err(error) => {
-                eprintln!(
-                    "[tdc-downloader] getfile error file={} dc={} offset={} error={}",
-                    job.filename,
-                    dc_id,
-                    offset,
-                    error
-                );
-                return Err(RunnerError::Grammers(error.to_string()));
-            }
+            Err(error) => return Err(RunnerError::Grammers(error.to_string())),
         }
     }
 }
@@ -963,13 +963,6 @@ async fn monitor_progress(
             })
             .await?;
         if bytes_delta == 0 && inflight_now > 0 {
-            eprintln!(
-                "[tdc-downloader] stall file={} inflight={} progress={} total={}",
-                filename,
-                inflight_now,
-                current_bytes,
-                total
-            );
             events
                 .emit(&Event::TransportStall {
                     file_id: file_id.clone(),
@@ -981,15 +974,6 @@ async fn monitor_progress(
                 })
                 .await?;
         }
-        eprintln!(
-            "[tdc-downloader] window file={} inflight={} mbps={:.2} parts={} progress={} total={}",
-            filename,
-            inflight_now.min(configured_inflight),
-            mbps,
-            completed_parts,
-            current_bytes,
-            total
-        );
         events
             .emit(&Event::TransportWindow {
                 file_id: file_id.clone(),
