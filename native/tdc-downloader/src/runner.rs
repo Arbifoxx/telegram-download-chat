@@ -728,10 +728,24 @@ async fn download_job(
         return Ok(DownloadOutcome::Stopped);
     }
     if let Some(error) = first_error {
+        emit_file_error(events, &job, &error).await?;
         return Err(error);
     }
 
-    finalize_job(&job).await?;
+    {
+        let temp = file.lock().await;
+        temp.sync_data().await?;
+    }
+    drop(file);
+    drop(completed_chunks);
+    drop(state_holder);
+    drop(next_chunk);
+    drop(progress);
+
+    if let Err(error) = finalize_job(&job).await {
+        emit_file_error(events, &job, &error).await?;
+        return Err(error);
+    }
     events
         .emit(&Event::FileCompleted {
             file_id: job.file_id.clone(),
@@ -741,6 +755,21 @@ async fn download_job(
         })
         .await?;
     Ok(DownloadOutcome::Completed)
+}
+
+async fn emit_file_error(
+    events: &EventWriter,
+    job: &DownloadJob,
+    error: &RunnerError,
+) -> Result<(), RunnerError> {
+    events
+        .emit(&Event::FileError {
+            file_id: job.file_id.clone(),
+            message_id: job.message_id.clone(),
+            filename: job.filename.clone(),
+            message: error.to_string(),
+        })
+        .await
 }
 
 fn target_inflight_for_job(concurrent_files: usize, large: bool, medium: bool) -> usize {
