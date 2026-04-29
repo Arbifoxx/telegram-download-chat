@@ -44,17 +44,6 @@ impl AuthTokens {
     }
 }
 
-fn mask_phone(phone: &str) -> String {
-    let trimmed = phone.trim();
-    if trimmed.len() <= 4 {
-        return trimmed.to_string();
-    }
-
-    let keep = 4usize;
-    let prefix_len = trimmed.len().saturating_sub(keep);
-    format!("{}{}", "*".repeat(prefix_len), &trimmed[prefix_len..])
-}
-
 pub async fn save_api_credentials(api_id: String, api_hash: String) -> AuthResult {
     if api_id.trim().is_empty() || api_hash.trim().is_empty() {
         return AuthResult {
@@ -147,9 +136,6 @@ pub async fn request_code_or_sign_in(
     password: String,
     tokens: AuthTokens,
 ) -> AuthResult {
-    let masked_phone = mask_phone(&phone_number);
-    let session_path = session_path();
-
     let creds = match parse_credentials(&api_id, &api_hash) {
         Ok(creds) => creds,
         Err(message) => {
@@ -173,17 +159,9 @@ pub async fn request_code_or_sign_in(
         };
     }
 
-    eprintln!(
-        "[tdc-auth] request_code_or_sign_in start: api_id={}, phone={}, session={}",
-        creds.api_id,
-        masked_phone,
-        session_path.display()
-    );
-
     let client = match connect_client(creds.api_id, &creds.api_hash).await {
         Ok(client) => client,
         Err(message) => {
-            eprintln!("[tdc-auth] failed to connect client: {message}");
             return AuthResult {
                 authorized: false,
                 message,
@@ -194,41 +172,7 @@ pub async fn request_code_or_sign_in(
         }
     };
 
-    match client.is_authorized().await {
-        Ok(true) => {
-            let identity_label = client
-                .get_me()
-                .await
-                .ok()
-                .map(|user| format!("Logged in as {}", user.full_name()));
-            eprintln!(
-                "[tdc-auth] session is already authorized; skipping code request for {}",
-                masked_phone
-            );
-            return AuthResult {
-                authorized: true,
-                message: "Already logged in.".to_string(),
-                keep_popup_open: false,
-                action: AuthAction::SignedIn,
-                identity_label,
-            };
-        }
-        Ok(false) => {
-            eprintln!(
-                "[tdc-auth] session is not authorized; proceeding with auth flow for {}",
-                masked_phone
-            );
-        }
-        Err(error) => {
-            eprintln!("[tdc-auth] failed to check authorization state: {error}");
-        }
-    }
-
     if code.trim().is_empty() {
-        eprintln!(
-            "[tdc-auth] requesting login code for {} using api_id={}",
-            masked_phone, creds.api_id
-        );
         match client
             .request_login_code(phone_number.trim(), &creds.api_hash)
             .await
@@ -236,10 +180,6 @@ pub async fn request_code_or_sign_in(
             Ok(token) => {
                 *tokens.login.lock().await = Some(Arc::new(token));
                 *tokens.password_pending.lock().await = false;
-                eprintln!(
-                    "[tdc-auth] login code request succeeded for {}; login token stored",
-                    masked_phone
-                );
                 AuthResult {
                     authorized: false,
                     message: "Code requested. Enter it below to continue.".to_string(),
@@ -248,33 +188,18 @@ pub async fn request_code_or_sign_in(
                     identity_label: None,
                 }
             }
-            Err(error) => {
-                eprintln!(
-                    "[tdc-auth] login code request failed for {}: {error}",
-                    masked_phone
-                );
-                AuthResult {
-                    authorized: false,
-                    message: format!("Failed to request code: {error}"),
-                    keep_popup_open: true,
-                    action: AuthAction::None,
-                    identity_label: None,
-                }
-            }
+            Err(error) => AuthResult {
+                authorized: false,
+                message: format!("Failed to request code: {error}"),
+                keep_popup_open: true,
+                action: AuthAction::None,
+                identity_label: None,
+            },
         }
     } else {
-        eprintln!(
-            "[tdc-auth] attempting sign-in for {} with code length {}",
-            masked_phone,
-            code.trim().len()
-        );
         let login_state = match tokens.login.lock().await.clone() {
             Some(token) => token,
             None => {
-                eprintln!(
-                    "[tdc-auth] no saved login token found for {}; request a code first",
-                    masked_phone
-                );
                 return AuthResult {
                     authorized: false,
                     message: "Request a code first.".to_string(),
@@ -290,7 +215,6 @@ pub async fn request_code_or_sign_in(
             .await
         {
             Ok(_) => {
-                eprintln!("[tdc-auth] sign-in succeeded for {}", masked_phone);
                 tokens.clear().await;
                 let identity_label = client
                     .get_me()
@@ -306,7 +230,6 @@ pub async fn request_code_or_sign_in(
                 }
             }
             Err(SignInError::PasswordRequired(password_token)) => {
-                eprintln!("[tdc-auth] password required for {}", masked_phone);
                 if password.trim().is_empty() {
                     *tokens.password_pending.lock().await = true;
                     AuthResult {
@@ -322,7 +245,6 @@ pub async fn request_code_or_sign_in(
                 } else {
                     match client.check_password(password_token, password.trim()).await {
                         Ok(_) => {
-                            eprintln!("[tdc-auth] password check succeeded for {}", masked_phone);
                             tokens.clear().await;
                             let identity_label = client
                                 .get_me()
@@ -337,32 +259,23 @@ pub async fn request_code_or_sign_in(
                                 identity_label,
                             }
                         }
-                        Err(error) => {
-                            eprintln!(
-                                "[tdc-auth] password check failed for {}: {error}",
-                                masked_phone
-                            );
-                            AuthResult {
-                                authorized: false,
-                                message: format!("Password check failed: {error}"),
-                                keep_popup_open: true,
-                                action: AuthAction::None,
-                                identity_label: None,
-                            }
-                        }
+                        Err(error) => AuthResult {
+                            authorized: false,
+                            message: format!("Password check failed: {error}"),
+                            keep_popup_open: true,
+                            action: AuthAction::None,
+                            identity_label: None,
+                        },
                     }
                 }
             }
-            Err(error) => {
-                eprintln!("[tdc-auth] sign-in failed for {}: {error}", masked_phone);
-                AuthResult {
-                    authorized: false,
-                    message: format!("Failed to sign in: {error}"),
-                    keep_popup_open: true,
-                    action: AuthAction::None,
-                    identity_label: None,
-                }
-            }
+            Err(error) => AuthResult {
+                authorized: false,
+                message: format!("Failed to sign in: {error}"),
+                keep_popup_open: true,
+                action: AuthAction::None,
+                identity_label: None,
+            },
         }
     }
 }
@@ -394,10 +307,6 @@ pub async fn logout(api_id: String, api_hash: String, tokens: AuthTokens) -> Aut
         }
     };
 
-    eprintln!(
-        "[tdc-auth] logging out session at {}",
-        session_path().display()
-    );
     let result = client.sign_out().await;
     let _ = tokio::fs::remove_file(session_path()).await;
     tokens.clear().await;
