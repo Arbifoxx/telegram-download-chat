@@ -499,6 +499,8 @@ async fn handle_event(
             let completed = value_u64(&event, "completed");
             let skipped = value_u64(&event, "skipped");
             let failed = value_u64(&event, "failed");
+            active_files.clear();
+            publish_files(snapshot, active_files);
             set_status(
                 snapshot,
                 &format!(
@@ -508,6 +510,8 @@ async fn handle_event(
         }
         "fatal_error" => {
             let message = value_string(&event, "message");
+            active_files.clear();
+            publish_files(snapshot, active_files);
             set_status(snapshot, &message);
         }
         _ => {}

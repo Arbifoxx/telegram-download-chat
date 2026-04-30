@@ -34,6 +34,9 @@ const WINDOW_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const SLOT_WAIT_INTERVAL: Duration = Duration::from_millis(25);
 const STATE_SAVE_INTERVAL_CHUNKS: usize = 8;
+const MAX_TRANSIENT_RETRIES: usize = 12;
+const TRANSPORT_RETRY_BASE_MS: u64 = 250;
+const TRANSPORT_RETRY_MAX_MS: u64 = 5000;
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -728,6 +731,25 @@ async fn download_job(
         return Ok(DownloadOutcome::Stopped);
     }
     if let Some(error) = first_error {
+        let bytes_done = progress.bytes_done();
+        cleanup_failed_job(&job, bytes_done).await?;
+        emit_file_error(events, &job, &error).await?;
+        return Err(error);
+    }
+
+    let completed_chunk_count = {
+        let state = state_holder.lock().await;
+        state.completed_chunks.len() as u64
+    };
+    let bytes_done = progress.bytes_done();
+    if job.expected_size > 0
+        && (completed_chunk_count != total_chunks || bytes_done != job.expected_size)
+    {
+        let error = RunnerError::Grammers(format!(
+            "download finished with incomplete data (chunks {completed_chunk_count}/{total_chunks}, bytes {bytes_done}/{})",
+            job.expected_size
+        ));
+        cleanup_failed_job(&job, bytes_done).await?;
         emit_file_error(events, &job, &error).await?;
         return Err(error);
     }
@@ -896,10 +918,6 @@ async fn worker_loop(
             }
         }
         progress.mark_bytes(bytes.len() as u64);
-
-        if bytes.len() < CHUNK_SIZE as usize {
-            break;
-        }
     }
 
     Ok(())
@@ -916,6 +934,7 @@ async fn fetch_chunk(
     events: &EventWriter,
 ) -> Result<Vec<u8>, RunnerError> {
     let mut dc_id = job.dc_id;
+    let mut transient_retries = 0usize;
     loop {
         if control.is_stop_requested() {
             return Ok(Vec::new());
@@ -934,8 +953,24 @@ async fn fetch_chunk(
         };
 
         let _permit = dc_limiter.acquire(dc_id).await?;
+        let expected_len = expected_chunk_len(job.expected_size, offset);
         match client.invoke_in_dc(dc_id, &request).await {
-            Ok(tl::enums::upload::File::File(file)) => return Ok(file.bytes),
+            Ok(tl::enums::upload::File::File(file)) => {
+                let actual_len = file.bytes.len();
+                if actual_len == expected_len {
+                    return Ok(file.bytes);
+                }
+
+                transient_retries += 1;
+                if transient_retries > MAX_TRANSIENT_RETRIES {
+                    return Err(RunnerError::Grammers(format!(
+                        "short chunk persisted after retries at offset {offset}: got {actual_len} bytes, expected {expected_len}"
+                    )));
+                }
+                let backoff = retry_backoff(transient_retries);
+                sleep(backoff).await;
+                continue;
+            }
             Ok(tl::enums::upload::File::CdnRedirect(_)) => {
                 return Err(RunnerError::Grammers("cdn redirects are not supported yet".to_string()));
             }
@@ -961,6 +996,7 @@ async fn fetch_chunk(
                     job.dc_id = new_dc;
                     dc_id = new_dc;
                 }
+                transient_retries = 0;
                 continue;
             }
             Err(grammers_mtsender::InvocationError::Rpc(error))
@@ -968,6 +1004,18 @@ async fn fetch_chunk(
             {
                 dc_id = error.value.unwrap() as i32;
                 job.dc_id = dc_id;
+                transient_retries = 0;
+                continue;
+            }
+            Err(error) if is_retryable_transport_error(&error) => {
+                transient_retries += 1;
+                if transient_retries > MAX_TRANSIENT_RETRIES {
+                    return Err(RunnerError::Grammers(format!(
+                        "request error after retries: {error}"
+                    )));
+                }
+                let backoff = retry_backoff(transient_retries);
+                sleep(backoff).await;
                 continue;
             }
             Err(error) => return Err(RunnerError::Grammers(error.to_string())),
@@ -1026,16 +1074,13 @@ async fn prepare_temp_file(job: &DownloadJob) -> Result<tokio::fs::File, RunnerE
     if let Some(parent) = Path::new(&job.temp_path).parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let file = tokio::fs::OpenOptions::new()
+    tokio::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .open(&job.temp_path)
-        .await?;
-    if job.expected_size > 0 {
-        file.set_len(job.expected_size).await?;
-    }
-    Ok(file)
+        .await
+        .map_err(RunnerError::from)
 }
 
 async fn finalize_job(job: &DownloadJob) -> Result<(), RunnerError> {
@@ -1046,6 +1091,14 @@ async fn finalize_job(job: &DownloadJob) -> Result<(), RunnerError> {
     let state_path = Path::new(&job.state_path);
     if state_path.exists() {
         tokio::fs::remove_file(state_path).await?;
+    }
+    Ok(())
+}
+
+async fn cleanup_failed_job(job: &DownloadJob, bytes_done: u64) -> Result<(), RunnerError> {
+    if bytes_done == 0 {
+        let _ = tokio::fs::remove_file(&job.temp_path).await;
+        let _ = tokio::fs::remove_file(&job.state_path).await;
     }
     Ok(())
 }
@@ -1202,13 +1255,22 @@ fn preflight_job(job: &DownloadJob) -> Result<PreflightOutcome, RunnerError> {
     }
 
     if job.skip_if_complete && is_complete_file(&final_path, job.expected_size)? {
+        remove_if_exists(&temp_path)?;
+        remove_if_exists(&state_path)?;
         return Ok(PreflightOutcome::SkipExisting);
     }
 
     if job.resume_if_partial {
         if let Some(state) = PartialState::load(&state_path)? {
             if state.is_compatible_with(job) && temp_path.exists() {
+                if fs::metadata(&temp_path).map(|meta| meta.len()).unwrap_or(0) == 0
+                    && state.completed_chunks.is_empty()
+                {
+                    remove_if_exists(&temp_path)?;
+                    remove_if_exists(&state_path)?;
+                } else {
                 return Ok(PreflightOutcome::Resume(state));
+                }
             }
         }
 
@@ -1257,12 +1319,57 @@ fn total_chunks_for_size(size: u64) -> u64 {
 }
 
 fn bytes_done_from_state(state: &PartialState, expected_size: u64) -> u64 {
-    let done = state.completed_chunks.len() as u64 * CHUNK_SIZE;
+    let total_chunks = total_chunks_for_size(expected_size).max(1);
+    let completed = state.completed_chunks.len() as u64;
+    let last_chunk_size = if expected_size == 0 {
+        CHUNK_SIZE
+    } else {
+        let remainder = expected_size % CHUNK_SIZE;
+        if remainder == 0 {
+            CHUNK_SIZE
+        } else {
+            remainder
+        }
+    };
+    let done = if completed == 0 {
+        0
+    } else if state.completed_chunks.contains(&(total_chunks.saturating_sub(1))) {
+        let non_last = completed.saturating_sub(1);
+        non_last * CHUNK_SIZE + last_chunk_size
+    } else {
+        completed * CHUNK_SIZE
+    };
     if expected_size > 0 {
         done.min(expected_size)
     } else {
         done
     }
+}
+
+fn expected_chunk_len(expected_size: u64, offset: u64) -> usize {
+    if expected_size == 0 {
+        return CHUNK_SIZE as usize;
+    }
+    let remaining = expected_size.saturating_sub(offset);
+    remaining.min(CHUNK_SIZE) as usize
+}
+
+fn retry_backoff(attempt: usize) -> Duration {
+    let exp = attempt.saturating_sub(1).min(6) as u32;
+    let millis = TRANSPORT_RETRY_BASE_MS
+        .saturating_mul(2u64.saturating_pow(exp))
+        .min(TRANSPORT_RETRY_MAX_MS);
+    Duration::from_millis(millis)
+}
+
+fn is_retryable_transport_error(error: &grammers_mtsender::InvocationError) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("bad status")
+        || text.contains("negative length -429")
+        || text.contains("transport error")
+        || text.contains("connection reset")
+        || text.contains("broken pipe")
+        || text.contains("timed out")
 }
 
 #[derive(Clone)]
